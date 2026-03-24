@@ -244,6 +244,9 @@ data:
     }
 
     # ── Trigger Velero backup ───────────────────────────────────
+    # Backs up all pods, PVCs, PVs, VirtualMachines, and DataVolumes
+    # in the target namespace. No labelSelector is used so that VM and
+    # DV manifests (which do not carry the reader-pod label) are included.
     trigger_velero_backup() {
       local backup_name=$1 ns=$2 pod_name=$3
       kubectl apply -f - <<EOF
@@ -259,9 +262,8 @@ data:
       - pods
       - persistentvolumeclaims
       - persistentvolumes
-      labelSelector:
-        matchLabels:
-          vmpvcbackup-cr: "${pod_name}"
+      - virtualmachines
+      - datavolumes
       defaultVolumesToFsBackup: true
       snapshotVolumes: false
     EOF
