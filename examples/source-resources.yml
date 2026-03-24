@@ -1,0 +1,112 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-j-dv
+  namespace: j-vms-2
+spec:
+  source:
+    http:
+      url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+  pvc:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: rook-ceph-block
+    resources:
+      requests:
+        storage: 20Gi
+---
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-j-datadisk-1
+  namespace: j-vms-2
+spec:
+  source:
+    blank: {}
+  pvc:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: rook-ceph-block
+    resources:
+      requests:
+        storage: 10Gi
+---
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-j-datadisk-2
+  namespace: j-vms-2
+spec:
+  source:
+    blank: {}
+  pvc:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: rook-ceph-block
+    resources:
+      requests:
+        storage: 10Gi
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ubuntu-j-vm
+  namespace: j-vms-2
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        vm-hostname: ubuntu-j-host
+    spec:
+      architecture: amd64
+      domain:
+        cpu:
+          cores: 2
+        devices:
+          disks:
+          - disk:
+              bus: virtio
+            cache: writethrough
+            name: rootdisk
+          - disk:
+              bus: virtio
+            name: cloudinitdisk
+          - disk:
+              bus: virtio
+            name: datadisk-1
+          - disk:
+              bus: virtio
+            name: datadisk-2
+        machine:
+          type: q35
+        resources:
+          requests:
+            memory: 4Gi
+      volumes:
+      - dataVolume:
+          name: ubuntu-j-dv
+        name: rootdisk
+      - cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            users:
+              - name: jiya
+                sudo: ALL=(ALL) NOPASSWD:ALL
+                shell: /bin/bash
+                ssh_authorized_keys:
+                  - ""
+            chpasswd:
+              list: |
+                <USERNAME>:<PASSWORD>
+              expire: false
+            runcmd:
+              - sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+              - sed -i 's/^ChallengeResponseAuthentication no/ChallengeResponseAuthentication yes/' /etc/ssh/sshd_config
+        name: cloudinitdisk
+      - dataVolume:
+          name: ubuntu-j-datadisk-1
+        name: datadisk-1
+      - dataVolume:
+          name: ubuntu-j-datadisk-2
+        name: datadisk-2

@@ -1,3 +1,54 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-j-dv
+  namespace: j-vms-5
+spec:
+  source:
+    pvc:
+      namespace: j-vms-5
+      name: ubuntu-j-dv
+  storage:
+    accessModes:
+      - ReadWriteMany
+    resources:
+      requests:
+        storage: 21Gi
+---
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-j-datadisk-1
+  namespace: j-vms-5
+spec:
+  source:
+    pvc:
+      namespace: j-vms-5
+      name: ubuntu-j-datadisk-1
+  storage:
+    accessModes:
+      - ReadWriteMany
+    resources:
+      requests:
+        storage: 21Gi
+---
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-j-datadisk-2
+  namespace: j-vms-5
+spec:
+  source:
+    pvc:
+      namespace: j-vms-5
+      name: ubuntu-j-datadisk-2
+  storage:
+    accessModes:
+      - ReadWriteMany
+    resources:
+      requests:
+        storage: 21Gi
+---
 apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
