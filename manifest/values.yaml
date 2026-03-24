@@ -1,0 +1,25 @@
+# Deployment namespace (where Velero is installed)
+namespace: velero
+
+# RBAC resource names
+serviceAccountName: vmb
+clusterRoleName: vmb
+clusterRoleBindingName: vmb
+
+# Controller Deployment
+replicaCount: 1
+
+image:
+  repository: bitnami/kubectl
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Controller script tunables
+controller:
+  pollInterval: 20           # seconds between reconcile loops
+  podReadyTimeout: 120       # seconds to wait for reader pod to reach Running
+
+  # Reader pod images per OS type
+  readerImages:
+    linux: "ubuntu:22.04"
+    windows: "mcr.microsoft.com/windows/servercore:ltsc2022"

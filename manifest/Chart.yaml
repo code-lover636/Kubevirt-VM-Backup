@@ -1,0 +1,11 @@
+apiVersion: v2
+name: kubevirt-vm-backup
+description: KubeVirt VM PVC Backup Controller — CRD + RBAC + Controller
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - kubevirt
+  - velero
+  - backup
+  - pvc

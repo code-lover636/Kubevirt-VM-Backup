@@ -115,7 +115,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: disk-explorer
-  namespace: j-vms-many
+  namespace: j-vms-2
   annotations:
     backup.velero.io/backup-volumes: disk1,disk2,disk3
 spec:
