@@ -1,0 +1,69 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ubuntu-j-vm
+  namespace: j-vms-5
+spec:
+  running: false
+  template:
+    metadata:
+      annotations:
+        kubevirt.io/pci-topology-version: v3
+      creationTimestamp: null
+      labels:
+        vm-hostname: ubuntu-j-host
+    spec:
+      architecture: amd64
+      domain:
+        cpu:
+          cores: 2
+        devices:
+          disks:
+          - cache: writethrough
+            disk:
+              bus: virtio
+            name: rootdisk
+          - disk:
+              bus: virtio
+            name: cloudinitdisk
+          - disk:
+              bus: virtio
+            name: datadisk-1
+          - disk:
+              bus: virtio
+            name: datadisk-2
+        firmware:
+          serial: 814f10fa-b7e8-485f-8f81-ae2ecade0208
+          uuid: b3a4e907-1750-4a34-8e6f-42c3ddf5c38d
+        machine:
+          type: q35
+        resources:
+          requests:
+            memory: 4Gi
+      volumes:
+      - dataVolume:
+          name: ubuntu-j-dv
+        name: rootdisk
+      - cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            users:
+              - name: jiya
+                sudo: ALL=(ALL) NOPASSWD:ALL
+                shell: /bin/bash
+                ssh_authorized_keys:
+                  - ""
+            chpasswd:
+              list: |
+                <USERNAME>:<PASSWORD>
+              expire: false
+            runcmd:
+              - sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+              - sed -i 's/^ChallengeResponseAuthentication no/ChallengeResponseAuthentication yes/' /etc/ssh/sshd_config
+        name: cloudinitdisk
+      - dataVolume:
+          name: ubuntu-j-datadisk-1
+        name: datadisk-1
+      - dataVolume:
+          name: ubuntu-j-datadisk-2
+        name: datadisk-2
