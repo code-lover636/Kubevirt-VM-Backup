@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: disk-explorer-1
+  namespace: j-vms-5
+  annotations:
+    backup.velero.io/backup-volumes: disk1,disk2,disk3
+spec:
+  nodeName: sim-up-w-w1
+  containers:
+  - name: explorer
+    image: ubuntu:22.04
+    command: ["sleep", "infinity"]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: disk1
+      mountPath: /data1
+    - name: disk2
+      mountPath: /data2
+    - name: disk3
+      mountPath: /data3
+  volumes:
+  - name: disk1
+    persistentVolumeClaim:
+      claimName: ubuntu-j-dv
+  - name: disk2
+    persistentVolumeClaim:
+      claimName: ubuntu-j-datadisk-1
+  - name: disk3
+    persistentVolumeClaim:
+      claimName: ubuntu-j-datadisk-2

@@ -10,7 +10,7 @@ spec:
       name: ubuntu-j-dv
   storage:
     accessModes:
-      - ReadWriteMany
+      - ReadWriteOnce
     resources:
       requests:
         storage: 21Gi
@@ -27,7 +27,7 @@ spec:
       name: ubuntu-j-datadisk-1
   storage:
     accessModes:
-      - ReadWriteMany
+      - ReadWriteOnce
     resources:
       requests:
         storage: 21Gi
@@ -44,7 +44,7 @@ spec:
       name: ubuntu-j-datadisk-2
   storage:
     accessModes:
-      - ReadWriteMany
+      - ReadWriteOnce
     resources:
       requests:
         storage: 21Gi
@@ -103,10 +103,10 @@ spec:
                 sudo: ALL=(ALL) NOPASSWD:ALL
                 shell: /bin/bash
                 ssh_authorized_keys:
-                  - ""
+                  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFnt6ZBwBUW0F/hPffkHDgPIy+4JnR6ZFfrQLqpBXx0G jiya@DESKTOP-FEUJGCU"
             chpasswd:
               list: |
-                <USERNAME>:<PASSWORD>
+                jiya:jiya123
               expire: false
             runcmd:
               - sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
