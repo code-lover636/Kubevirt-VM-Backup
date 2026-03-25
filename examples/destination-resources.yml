@@ -2,11 +2,11 @@ apiVersion: cdi.kubevirt.io/v1beta1
 kind: DataVolume
 metadata:
   name: ubuntu-j-dv
-  namespace: j-vms-5
+  namespace: ubuntu-ns
 spec:
   source:
     pvc:
-      namespace: j-vms-5
+      namespace: ubuntu-ns
       name: ubuntu-j-dv
   storage:
     accessModes:
@@ -19,11 +19,11 @@ apiVersion: cdi.kubevirt.io/v1beta1
 kind: DataVolume
 metadata:
   name: ubuntu-j-datadisk-1
-  namespace: j-vms-5
+  namespace: ubuntu-ns
 spec:
   source:
     pvc:
-      namespace: j-vms-5
+      namespace: ubuntu-ns
       name: ubuntu-j-datadisk-1
   storage:
     accessModes:
@@ -36,11 +36,11 @@ apiVersion: cdi.kubevirt.io/v1beta1
 kind: DataVolume
 metadata:
   name: ubuntu-j-datadisk-2
-  namespace: j-vms-5
+  namespace: ubuntu-ns
 spec:
   source:
     pvc:
-      namespace: j-vms-5
+      namespace: ubuntu-ns
       name: ubuntu-j-datadisk-2
   storage:
     accessModes:
@@ -53,7 +53,7 @@ apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
   name: ubuntu-j-vm
-  namespace: j-vms-5
+  namespace: ubuntu-ns
 spec:
   running: false
   template:
