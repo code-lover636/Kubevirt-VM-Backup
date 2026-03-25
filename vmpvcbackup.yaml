@@ -1,6 +1,5 @@
 # ============================================================
 # 1. CRD — VMPVCBackup
-#    Automates: create reader pod → wait → velero backup
 # ============================================================
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -26,8 +25,11 @@ spec:
         properties:
           spec:
             type: object
-            required: [pvcs, backupName]
+            required: [pvcs, backupName, vmName]
             properties:
+              vmName:
+                type: string
+                description: Name of the VirtualMachine to back up (its yaml will be included)
               pvcs:
                 type: array
                 description: List of PVC names to mount and back up
@@ -40,6 +42,12 @@ spec:
                 type: string
                 default: velero
                 description: Namespace where Velero is installed
+              nodeName:
+                type: string
+                description: >-
+                  Node where the VM is running. If set, the reader pod is pinned
+                  to this node (skips auto-detection). Use this when auto-detection
+                  picks the wrong node or when stale pods cause conflicts.
               osType:
                 type: string
                 enum: [linux, windows]
@@ -52,6 +60,8 @@ spec:
                 type: string
                 enum: [Pending, CreatingPod, WaitingForPod, BackingUp, Completed, Failed]
               readerPodName:
+                type: string
+              targetNode:
                 type: string
               veleroBackupName:
                 type: string
@@ -66,6 +76,9 @@ spec:
     - name: Pod
       type: string
       jsonPath: .status.readerPodName
+    - name: Node
+      type: string
+      jsonPath: .status.targetNode
     - name: Backup
       type: string
       jsonPath: .status.veleroBackupName
@@ -98,9 +111,15 @@ rules:
 - apiGroups: [""]
   resources: [pods]
   verbs: [get, list, create, delete, watch]
+- apiGroups: [kubevirt.io]
+  resources: [virtualmachines]
+  verbs: [get, list, patch]
+- apiGroups: [cdi.kubevirt.io]
+  resources: [datavolumes]
+  verbs: [get, list]
 - apiGroups: [velero.io]
-  resources: [backups]
-  verbs: [get, list, create]
+  resources: [backups, restores]
+  verbs: [get, list, watch, create]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -128,25 +147,49 @@ metadata:
 data:
   controller.sh: |
     #!/bin/bash
-    set -euo pipefail
+    set -uo pipefail
 
     POLL_INTERVAL=20
-    POD_READY_TIMEOUT=120   # seconds to wait for reader pod to become Running
+    POD_READY_TIMEOUT=300
 
-    # ── Patch CR status ────────────────────────────────────────
+    log_info()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO]  $*"; }
+    log_warn()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN]  $*"; }
+    log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*"; }
+
+    # ── Patch CR status ─────────────────────────────────────────
     patch_status() {
       local name=$1 ns=$2 phase=$3 msg=$4
       kubectl patch vmpvcbackup "$name" -n "$ns" \
         --subresource=status --type=merge \
         -p "{\"status\":{\"phase\":\"${phase}\",\"message\":\"${msg}\"}}" \
-        2>/dev/null || true
+        2>/dev/null \
+        || log_warn "[$name] Could not patch status to '$phase' — continuing"
     }
 
-    # ── Build backup.velero.io/backup-volumes annotation ───────
+    # ── Find node running the virt-launcher pod for the VM ──────
+    get_node_for_vm() {
+      local vm_name=$1 ns=$2
+      kubectl get pods -n "$ns" \
+        -l "kubevirt.io/vm=${vm_name}" \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null
+    }
+
+    # ── Fallback: find node running a pod that mounts a given PVC
+    get_node_for_pvc() {
+      local pvc=$1 ns=$2
+      kubectl get pods -n "$ns" --field-selector=status.phase=Running \
+        -o jsonpath='{range .items[*]}{.spec.nodeName}{"\t"}{range .spec.volumes[*]}{.persistentVolumeClaim.claimName}{" "}{end}{"\n"}{end}' \
+        2>/dev/null \
+      | awk -v pvc="$pvc" '{
+          node=$1
+          for(i=2;i<=NF;i++) if($i==pvc){print node; exit}
+        }' | head -1
+    }
+
+    # ── Build backup.velero.io/backup-volumes annotation value ──
     build_backup_vols_annotation() {
-      local pvcs=("$@")
-      local count=${#pvcs[@]}
-      local result=""
+      local pvcs=("$@") count=${#pvcs[@]} result="" i
       for ((i=1; i<=count; i++)); do
         result+="disk${i}"
         [[ $i -lt $count ]] && result+=","
@@ -154,11 +197,10 @@ data:
       echo "$result"
     }
 
-    # ── Build volumeMounts block ────────────────────────────────
+    # ── Build volumeMounts block ─────────────────────────────────
     build_volume_mounts() {
       local os_type=$1; shift
-      local pvcs=("$@")
-      local idx=1
+      local pvcs=("$@") idx=1
       for _ in "${pvcs[@]}"; do
         if [[ "$os_type" == "windows" ]]; then
           echo "    - name: disk${idx}"
@@ -171,10 +213,9 @@ data:
       done
     }
 
-    # ── Build volumes block ─────────────────────────────────────
+    # ── Build volumes block ──────────────────────────────────────
     build_volumes() {
-      local pvcs=("$@")
-      local idx=1
+      local pvcs=("$@") idx=1
       for pvc in "${pvcs[@]}"; do
         echo "  - name: disk${idx}"
         echo "    persistentVolumeClaim:"
@@ -183,10 +224,30 @@ data:
       done
     }
 
-    # ── Create the reader pod ───────────────────────────────────
+    # ── Delete reader pod ────────────────────────────────────────
+    delete_reader_pod() {
+      local pod_name=$1 ns=$2 reason=$3
+      if kubectl get pod "$pod_name" -n "$ns" &>/dev/null; then
+        log_info "[$pod_name] Deleting reader pod (reason: $reason)"
+        if kubectl delete pod "$pod_name" -n "$ns" --ignore-not-found 2>/dev/null; then
+          log_info "[$pod_name] Reader pod deleted successfully"
+        else
+          log_warn "[$pod_name] Delete returned non-zero — pod may linger; will retry next cycle"
+        fi
+      fi
+    }
+
+    # ── Create reader pod pinned to target_node ──────────────────
     create_reader_pod() {
-      local pod_name=$1 ns=$2 os_type=$3; shift 3
+      local pod_name=$1 ns=$2 os_type=$3 target_node=$4; shift 4
       local pvcs=("$@")
+
+      if [[ -z "$target_node" ]]; then
+        log_error "[$pod_name] target_node is empty — refusing to create reader pod" \
+                  "to avoid RWO Multi-Attach. Is the VM running?"
+        return 1
+      fi
+
       local backup_vols
       backup_vols=$(build_backup_vols_annotation "${pvcs[@]}")
 
@@ -199,7 +260,15 @@ data:
         cmd='["sleep", "infinity"]'
       fi
 
-      kubectl apply -f - <<EOF
+      local node_selector_block=""
+      if [[ "$os_type" == "windows" ]]; then
+        node_selector_block="  nodeSelector:
+      kubernetes.io/os: windows"
+      fi
+
+      log_info "[$pod_name] Creating reader pod | node=$target_node | pvcs=${pvcs[*]}"
+
+      if ! kubectl apply -f - <<EOF
     apiVersion: v1
     kind: Pod
     metadata:
@@ -211,8 +280,8 @@ data:
       annotations:
         backup.velero.io/backup-volumes: ${backup_vols}
     spec:
-      $([ "$os_type" = "windows" ] && echo "nodeSelector:" || true)
-      $([ "$os_type" = "windows" ] && echo "  kubernetes.io/os: windows" || true)
+      nodeName: ${target_node}
+    ${node_selector_block}
       containers:
       - name: explorer
         image: ${image}
@@ -224,29 +293,79 @@ data:
       volumes:
     $(build_volumes "${pvcs[@]}")
     EOF
+      then
+        log_error "[$pod_name] kubectl apply failed — verify PVCs exist: ${pvcs[*]}"
+        return 1
+      fi
+
+      log_info "[$pod_name] Reader pod submitted on node '$target_node'"
     }
 
-    # ── Wait for reader pod to be Running ───────────────────────
+    # ── Wait for reader pod Running ──────────────────────────────
     wait_for_pod() {
       local pod_name=$1 ns=$2
       local elapsed=0
-      echo "[INFO] Waiting for pod $pod_name to be Running..."
+      log_info "[$pod_name] Waiting for pod Running (timeout ${POD_READY_TIMEOUT}s)..."
       while true; do
         local phase
         phase=$(kubectl get pod "$pod_name" -n "$ns" \
           -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-        [[ "$phase" == "Running" ]] && return 0
-        [[ "$phase" == "Failed" || "$phase" == "Error" ]] && return 1
-        sleep 5
-        elapsed=$((elapsed + 5))
-        [[ $elapsed -ge $POD_READY_TIMEOUT ]] && return 1
+        case "$phase" in
+          Running)
+            log_info "[$pod_name] Pod is Running"
+            return 0
+            ;;
+          Failed|Error|CrashLoopBackOff)
+            local reason
+            reason=$(kubectl get pod "$pod_name" -n "$ns" \
+              -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' \
+              2>/dev/null || echo "unknown")
+            log_error "[$pod_name] Pod entered terminal state '$phase' (reason: $reason)"
+            return 1
+            ;;
+          *)
+            if [[ $elapsed -ge $POD_READY_TIMEOUT ]]; then
+              log_error "[$pod_name] Timed out after ${POD_READY_TIMEOUT}s" \
+                        "(last phase: $phase) — run: kubectl describe pod $pod_name -n $ns"
+              return 1
+            fi
+            sleep 5; elapsed=$((elapsed+5))
+            ;;
+        esac
       done
     }
 
-    # ── Trigger Velero backup ───────────────────────────────────
+    # ── Label VM so Velero labelSelector picks it up ─────────────
+    label_vm() {
+      local vm_name=$1 ns=$2 cr_name=$3
+      log_info "[$cr_name] Labeling VM '$vm_name' with vmpvcbackup-cr=$cr_name"
+      if ! kubectl label vm "$vm_name" -n "$ns" \
+          "vmpvcbackup-cr=${cr_name}" --overwrite 2>/dev/null; then
+        log_warn "[$cr_name] Could not label VM '$vm_name'" \
+                 "— VM yaml may be missing from backup"
+      else
+        log_info "[$cr_name] VM '$vm_name' labeled successfully"
+      fi
+    }
+
+    # ── Remove backup label from VM after backup ─────────────────
+    unlabel_vm() {
+      local vm_name=$1 ns=$2 cr_name=$3
+      if kubectl get vm "$vm_name" -n "$ns" &>/dev/null; then
+        kubectl label vm "$vm_name" -n "$ns" \
+          "vmpvcbackup-cr-" 2>/dev/null \
+          || log_warn "[$cr_name] Could not remove label from VM '$vm_name'"
+        log_info "[$cr_name] VM '$vm_name' label removed"
+      fi
+    }
+
+    # ── Trigger Velero backup ────────────────────────────────────
     trigger_velero_backup() {
-      local backup_name=$1 ns=$2 pod_name=$3
-      kubectl apply -f - <<EOF
+      local backup_name=$1 ns=$2 pod_name=$3 cr_name=$4
+      log_info "[$backup_name] Creating Velero Backup" \
+               "| selector: vmpvcbackup-cr=$pod_name (pod+pvcs) and vmpvcbackup-cr=$cr_name (vm)"
+
+      if ! kubectl apply -f - <<EOF
     apiVersion: velero.io/v1
     kind: Backup
     metadata:
@@ -259,95 +378,281 @@ data:
       - pods
       - persistentvolumeclaims
       - persistentvolumes
-      labelSelector:
-        matchLabels:
+      - virtualmachines
+      - datavolumes
+      orLabelSelectors:
+      - matchLabels:
           vmpvcbackup-cr: "${pod_name}"
+      - matchLabels:
+          vmpvcbackup-cr: "${cr_name}"
       defaultVolumesToFsBackup: true
       snapshotVolumes: false
     EOF
+      then
+        log_error "[$backup_name] kubectl apply failed — check velero namespace and RBAC"
+        return 1
+      fi
+
+      log_info "[$backup_name] Velero Backup object created"
     }
 
-    # ── Main reconcile loop ─────────────────────────────────────
-    reconcile() {
-      local name=$1 ns=$2
+    # ── Print full Velero backup error details to console ────────
+    print_velero_errors() {
+      local backup_name=$1
+      log_error "══════════════════════════════════════════════"
+      log_error "VELERO BACKUP FAILURE DETAILS: $backup_name"
+      log_error "══════════════════════════════════════════════"
 
-      # Read spec fields
-      local pvcs_raw os_type backup_name
-      pvcs_raw=$(kubectl get vmpvcbackup "$name" -n "$ns" \
-        -o jsonpath='{.spec.pvcs}' | tr -d '[]"' | tr ',' ' ')
-      os_type=$(kubectl get vmpvcbackup "$name" -n "$ns" \
-        -o jsonpath='{.spec.osType}')
-      backup_name=$(kubectl get vmpvcbackup "$name" -n "$ns" \
-        -o jsonpath='{.spec.backupName}')
-      local pvcs=($pvcs_raw)
+      local failure_reason
+      failure_reason=$(kubectl get backup "$backup_name" -n velero \
+        -o jsonpath='{.status.failureReason}' 2>/dev/null || echo "")
+      [[ -n "$failure_reason" ]] && log_error "  Failure Reason : $failure_reason"
 
-      local pod_name="reader-${name}"
+      local warnings
+      warnings=$(kubectl get backup "$backup_name" -n velero \
+        -o jsonpath='{.status.warnings}' 2>/dev/null || echo "0")
+      local errors
+      errors=$(kubectl get backup "$backup_name" -n velero \
+        -o jsonpath='{.status.errors}' 2>/dev/null || echo "0")
+      log_error "  Warnings       : $warnings"
+      log_error "  Errors         : $errors"
 
-      # Skip if already completed/failed
-      local current_phase
-      current_phase=$(kubectl get vmpvcbackup "$name" -n "$ns" \
-        -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-      if [[ "$current_phase" == "Completed" || "$current_phase" == "Failed" ]]; then
+      kubectl logs -n velero -l app.kubernetes.io/name=velero --tail=50 2>/dev/null \
+        | grep -i "$backup_name" \
+        | while IFS= read -r logline; do
+            log_error "    $logline"
+          done
+
+      log_error "  Full details   : kubectl describe backup $backup_name -n velero"
+      log_error "══════════════════════════════════════════════"
+    }
+
+    # ── Orphan sweep ─────────────────────────────────────────────
+    cleanup_orphaned_reader_pods() {
+      local list
+      list=$(kubectl get pods --all-namespaces \
+        -l app=vmpvcbackup-reader \
+        -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name \
+        --no-headers 2>/dev/null) || return 0
+      [[ -z "$list" ]] && return 0
+
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local pod_ns pod_name cr_name cr_phase
+        pod_ns=$(awk '{print $1}' <<< "$line")
+        pod_name=$(awk '{print $2}' <<< "$line")
+        cr_name="${pod_name#reader-}"
+        cr_phase=$(kubectl get vmpvcbackup "$cr_name" -n "$pod_ns" \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+        if [[ "$cr_phase" == "Completed" || "$cr_phase" == "Failed" || "$cr_phase" == "NotFound" ]]; then
+          log_warn "[$pod_name] Orphaned reader pod (CR '$cr_name' is '$cr_phase') — removing"
+          delete_reader_pod "$pod_name" "$pod_ns" "orphaned — CR is '$cr_phase'"
+        fi
+      done <<< "$list"
+    }
+
+    # ── Resolve target node ──────────────────────────────────────
+    resolve_node() {
+      local name=$1 ns=$2 vm_name=$3 spec_node=$4 first_pvc=$5
+
+      # Priority 1: Explicit nodeName from CR spec
+      if [[ -n "$spec_node" ]]; then
+        log_info "[$name] Using explicit nodeName from spec: $spec_node" >&2
+        echo "$spec_node"
         return 0
       fi
 
-      # ── Step 1: Create reader pod ───────────────────────────
-      if ! kubectl get pod "$pod_name" -n "$ns" &>/dev/null; then
-        echo "[INFO] Creating reader pod: $pod_name"
-        patch_status "$name" "$ns" "CreatingPod" "Creating reader pod ${pod_name}"
-        kubectl patch vmpvcbackup "$name" -n "$ns" \
-          --subresource=status --type=merge \
-          -p "{\"status\":{\"readerPodName\":\"${pod_name}\",\"veleroBackupName\":\"${backup_name}\"}}" \
-          2>/dev/null || true
-        create_reader_pod "$pod_name" "$ns" "$os_type" "${pvcs[@]}"
+      # Priority 2: Find the virt-launcher pod for the VM
+      local node=""
+      if [[ -n "$vm_name" ]]; then
+        node=$(get_node_for_vm "$vm_name" "$ns")
+        if [[ -n "$node" ]]; then
+          log_info "[$name] Resolved node from virt-launcher (VM=$vm_name): $node" >&2
+          echo "$node"
+          return 0
+        fi
       fi
 
-      # ── Step 2: Wait for pod Running ───────────────────────
-      local pod_phase
-      pod_phase=$(kubectl get pod "$pod_name" -n "$ns" \
-        -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
+      # Priority 3: Fallback to PVC-based detection
+      node=$(get_node_for_pvc "$first_pvc" "$ns")
+      if [[ -n "$node" ]]; then
+        log_info "[$name] Resolved node from PVC '$first_pvc': $node" >&2
+        echo "$node"
+        return 0
+      fi
 
-      if [[ "$pod_phase" != "Running" ]]; then
-        patch_status "$name" "$ns" "WaitingForPod" "Waiting for reader pod to reach Running state"
-        if ! wait_for_pod "$pod_name" "$ns"; then
-          patch_status "$name" "$ns" "Failed" "Reader pod $pod_name failed to reach Running state"
+      return 1
+    }
+
+    # ── Main reconcile ───────────────────────────────────────────
+    reconcile() {
+      local name=$1 ns=$2
+
+      local current_phase
+      current_phase=$(kubectl get vmpvcbackup "$name" -n "$ns" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+      [[ "$current_phase" == "Completed" || "$current_phase" == "Failed" ]] && return 0
+
+      # Read spec
+      local pvcs_raw os_type backup_name vm_name spec_node
+      if ! pvcs_raw=$(kubectl get vmpvcbackup "$name" -n "$ns" \
+              -o jsonpath='{.spec.pvcs}' 2>/dev/null | tr -d '[]"' | tr ',' ' ') \
+         || ! os_type=$(kubectl get vmpvcbackup "$name" -n "$ns" \
+              -o jsonpath='{.spec.osType}' 2>/dev/null) \
+         || ! backup_name=$(kubectl get vmpvcbackup "$name" -n "$ns" \
+              -o jsonpath='{.spec.backupName}' 2>/dev/null) \
+         || ! vm_name=$(kubectl get vmpvcbackup "$name" -n "$ns" \
+              -o jsonpath='{.spec.vmName}' 2>/dev/null); then
+        log_error "[$name] Failed to read CR spec — check API server"
+        patch_status "$name" "$ns" "Failed" "Could not read CR spec"
+        return 1
+      fi
+
+      # Read optional nodeName (empty string if not set)
+      spec_node=$(kubectl get vmpvcbackup "$name" -n "$ns" \
+        -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
+
+      local pvcs=($pvcs_raw)
+      if [[ ${#pvcs[@]} -eq 0 ]]; then
+        log_error "[$name] spec.pvcs is empty"
+        patch_status "$name" "$ns" "Failed" "spec.pvcs is empty"
+        return 1
+      fi
+
+      local pod_name="reader-${name}"
+
+      # ── Step 1: Resolve node ──────────────────────────────────
+      local target_node=""
+      target_node=$(resolve_node "$name" "$ns" "$vm_name" "$spec_node" "${pvcs[0]}")
+
+      if [[ -z "$target_node" ]]; then
+        log_warn "[$name] Could not resolve target node" \
+                 "— is the VM running? Set spec.nodeName to override. Retrying next cycle."
+        patch_status "$name" "$ns" "Pending" \
+          "Waiting for VM to be running or set spec.nodeName"
+        return 0
+      fi
+
+      log_info "[$name] Target node resolved: '$target_node'"
+
+      # ── Step 2: Reuse existing reader pod or create new one ────
+      local need_create=true
+      if kubectl get pod "$pod_name" -n "$ns" &>/dev/null; then
+        local existing_node existing_phase
+        existing_node=$(kubectl get pod "$pod_name" -n "$ns" \
+          -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
+        existing_phase=$(kubectl get pod "$pod_name" -n "$ns" \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+
+        if [[ "$existing_node" != "$target_node" ]]; then
+          log_warn "[$name] Reader pod is on '$existing_node'" \
+                   "but target is '$target_node' — deleting and recreating"
+          delete_reader_pod "$pod_name" "$ns" "wrong node"
+          sleep 5
+        elif [[ "$existing_phase" == "Running" ]]; then
+          log_info "[$name] Reader pod already Running on correct node '$target_node' — reusing"
+          need_create=false
+        elif [[ "$existing_phase" == "Failed" || "$existing_phase" == "Error" ]]; then
+          log_warn "[$name] Reader pod in '$existing_phase' state — deleting and recreating"
+          delete_reader_pod "$pod_name" "$ns" "pod in $existing_phase state"
+          sleep 5
+        else
+          log_info "[$name] Reader pod exists (phase: $existing_phase) — waiting for it"
+          need_create=false
+        fi
+      fi
+
+      if [[ "$need_create" == "true" ]]; then
+        # ── Step 3: Create fresh reader pod ─────────────────────
+        patch_status "$name" "$ns" "CreatingPod" \
+          "Creating reader pod '${pod_name}' on node '${target_node}'"
+        kubectl patch vmpvcbackup "$name" -n "$ns" \
+          --subresource=status --type=merge \
+          -p "{\"status\":{\"readerPodName\":\"${pod_name}\",\"targetNode\":\"${target_node}\",\"veleroBackupName\":\"${backup_name}\"}}" \
+          2>/dev/null || true
+
+        if ! create_reader_pod "$pod_name" "$ns" "$os_type" "$target_node" "${pvcs[@]}"; then
+          patch_status "$name" "$ns" "Failed" \
+            "Failed to create reader pod on node '${target_node}' — verify PVCs: ${pvcs[*]}"
           return 1
         fi
       fi
 
-      # ── Step 3: Trigger Velero backup ──────────────────────
-      if ! kubectl get backup "$backup_name" -n velero &>/dev/null; then
-        echo "[INFO] Triggering Velero backup: $backup_name"
-        patch_status "$name" "$ns" "BackingUp" "Velero backup ${backup_name} triggered"
-        trigger_velero_backup "$backup_name" "$ns" "$pod_name"
+      # ── Step 4: Wait for pod Running ──────────────────────────
+      patch_status "$name" "$ns" "WaitingForPod" \
+        "Waiting for reader pod '${pod_name}' on node '${target_node}'"
+      if ! wait_for_pod "$pod_name" "$ns"; then
+        log_error "[$name] Reader pod '${pod_name}' never reached Running." \
+                  " Run: kubectl describe pod $pod_name -n $ns"
+        patch_status "$name" "$ns" "Failed" \
+          "Reader pod stuck — run: kubectl describe pod $pod_name -n $ns"
+        delete_reader_pod "$pod_name" "$ns" "pod failed to reach Running"
+        return 1
       fi
 
-      # ── Step 4: Wait for backup to complete ────────────────
+      # ── Step 5: Label VM for Velero ───────────────────────────
+      if [[ -n "$vm_name" ]]; then
+        label_vm "$vm_name" "$ns" "$name"
+      fi
+
+      # ── Step 6: Trigger Velero backup ─────────────────────────
+      if ! kubectl get backup "$backup_name" -n velero &>/dev/null; then
+        patch_status "$name" "$ns" "BackingUp" \
+          "Velero backup '${backup_name}' triggered"
+        if ! trigger_velero_backup "$backup_name" "$ns" "$pod_name" "$name"; then
+          [[ -n "$vm_name" ]] && unlabel_vm "$vm_name" "$ns" "$name"
+          delete_reader_pod "$pod_name" "$ns" "backup trigger failed"
+          patch_status "$name" "$ns" "Failed" \
+            "Failed to create Velero Backup '${backup_name}' — check velero RBAC"
+          return 1
+        fi
+      fi
+
+      # ── Step 7: Poll Velero backup phase ──────────────────────
       local backup_phase
       backup_phase=$(kubectl get backup "$backup_name" -n velero \
         -o jsonpath='{.status.phase}' 2>/dev/null || echo "New")
 
-      if [[ "$backup_phase" == "Completed" ]]; then
-        echo "[INFO] Backup $backup_name completed. Cleaning up reader pod."
-        kubectl delete pod "$pod_name" -n "$ns" --ignore-not-found
-        patch_status "$name" "$ns" "Completed" "Backup ${backup_name} completed successfully"
-      elif [[ "$backup_phase" == "Failed" || "$backup_phase" == "PartiallyFailed" ]]; then
-        patch_status "$name" "$ns" "Failed" "Velero backup ${backup_name} failed"
-      fi
+      case "$backup_phase" in
+        Completed)
+          log_info "[$name] Backup '$backup_name' completed successfully"
+          delete_reader_pod "$pod_name" "$ns" "backup completed"
+          [[ -n "$vm_name" ]] && unlabel_vm "$vm_name" "$ns" "$name"
+          patch_status "$name" "$ns" "Completed" \
+            "Backup '${backup_name}' completed; reader pod removed"
+          ;;
+        Failed|PartiallyFailed)
+          print_velero_errors "$backup_name"
+          delete_reader_pod "$pod_name" "$ns" "backup ${backup_phase}"
+          [[ -n "$vm_name" ]] && unlabel_vm "$vm_name" "$ns" "$name"
+          local velero_err
+          velero_err=$(kubectl get backup "$backup_name" -n velero \
+            -o jsonpath='{.status.failureReason}' 2>/dev/null \
+            || echo "see velero logs")
+          patch_status "$name" "$ns" "Failed" \
+            "Backup '${backup_name}' ${backup_phase}: ${velero_err}"
+          ;;
+        *)
+          log_info "[$name] Backup '${backup_name}' in progress (phase: ${backup_phase:-New})"
+          ;;
+      esac
     }
 
-    echo "[INFO] VMPVCBackup controller started"
+    # ── Main loop ────────────────────────────────────────────────
+    log_info "VMPVCBackup controller started (poll interval: ${POLL_INTERVAL}s)"
 
     while true; do
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        ns=$(echo "$line" | awk '{print $1}')
-        nm=$(echo "$line" | awk '{print $2}')
+        ns=$(awk '{print $1}' <<< "$line")
+        nm=$(awk '{print $2}' <<< "$line")
         reconcile "$nm" "$ns" \
-          || echo "[WARN] Reconcile failed for $nm in $ns"
+          || log_warn "Reconcile non-zero for '$nm'/'$ns' — will retry next cycle"
       done < <(kubectl get vmpvcbackups --all-namespaces \
         -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name \
         --no-headers 2>/dev/null)
+
+      cleanup_orphaned_reader_pods
 
       sleep "$POLL_INTERVAL"
     done
