@@ -101,6 +101,9 @@ rules:
 - apiGroups: [velero.io]
   resources: [backups]
   verbs: [get, list, create]
+- apiGroups: [cdi.kubevirt.io]
+  resources: [datavolumes]
+  verbs: [get, list, patch]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -243,7 +246,55 @@ data:
       done
     }
 
+    # ── Patch blank DataVolume sources to reference their own PVC ──────────
+    # DVs with source.blank would restore as empty disks; patching them to
+    # source.pvc before backup ensures the restored manifest clones from the
+    # backed-up PVC.  Each patched DV is tagged so it can be reverted later.
+    patch_blank_dv_sources() {
+      local ns=$1
+      while IFS= read -r dv_name; do
+        [[ -z "$dv_name" ]] && continue
+        # Check .spec.source specifically to avoid false positives elsewhere in the manifest
+        local dv_source
+        dv_source=$(kubectl get datavolume "$dv_name" -n "$ns" \
+          -o jsonpath='{.spec.source}' 2>/dev/null || echo "")
+        if echo "$dv_source" | grep -q '"blank"'; then
+          # Prefer the actual PVC name recorded in status; fall back to DV name
+          local pvc_name
+          pvc_name=$(kubectl get datavolume "$dv_name" -n "$ns" \
+            -o jsonpath='{.status.claimName}' 2>/dev/null)
+          [[ -z "$pvc_name" ]] && pvc_name="$dv_name"
+          echo "[INFO] Patching DV $dv_name: source.blank → source.pvc (pvc: $pvc_name)"
+          if ! kubectl patch datavolume "$dv_name" -n "$ns" --type=merge \
+              -p "{\"metadata\":{\"labels\":{\"backup.kubevirt.io/original-dv-source\":\"blank\"}},\"spec\":{\"source\":{\"blank\":null,\"pvc\":{\"namespace\":\"${ns}\",\"name\":\"${pvc_name}\"}}}}" \
+              2>&1; then
+            echo "[WARN] Failed to patch DV $dv_name source; it will be backed up with source.blank"
+          fi
+        fi
+      done < <(kubectl get datavolumes -n "$ns" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    }
+
+    # ── Restore blank DataVolume sources after backup ───────────────────────
+    restore_blank_dv_sources() {
+      local ns=$1
+      while IFS= read -r dv_name; do
+        [[ -z "$dv_name" ]] && continue
+        echo "[INFO] Restoring DV $dv_name: source.pvc → source.blank"
+        if ! kubectl patch datavolume "$dv_name" -n "$ns" --type=merge \
+            -p "{\"metadata\":{\"labels\":{\"backup.kubevirt.io/original-dv-source\":null}},\"spec\":{\"source\":{\"pvc\":null,\"blank\":{}}}}" \
+            2>&1; then
+          echo "[WARN] Failed to restore DV $dv_name source; it may remain in patched state"
+        fi
+      done < <(kubectl get datavolumes -n "$ns" \
+        -l "backup.kubevirt.io/original-dv-source=blank" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    }
+
     # ── Trigger Velero backup ───────────────────────────────────
+    # Backs up all pods, PVCs, PVs, VirtualMachines, and DataVolumes
+    # in the target namespace. No labelSelector is used so that VM and
+    # DV manifests (which do not carry the reader-pod label) are included.
     trigger_velero_backup() {
       local backup_name=$1 ns=$2 pod_name=$3
       kubectl apply -f - <<EOF
@@ -259,9 +310,8 @@ data:
       - pods
       - persistentvolumeclaims
       - persistentvolumes
-      labelSelector:
-        matchLabels:
-          vmpvcbackup-cr: "${pod_name}"
+      - virtualmachines
+      - datavolumes
       defaultVolumesToFsBackup: true
       snapshotVolumes: false
     EOF
@@ -317,6 +367,8 @@ data:
 
       # ── Step 3: Trigger Velero backup ──────────────────────
       if ! kubectl get backup "$backup_name" -n velero &>/dev/null; then
+        echo "[INFO] Patching blank DV sources before backup"
+        patch_blank_dv_sources "$ns"
         echo "[INFO] Triggering Velero backup: $backup_name"
         patch_status "$name" "$ns" "BackingUp" "Velero backup ${backup_name} triggered"
         trigger_velero_backup "$backup_name" "$ns" "$pod_name"
@@ -330,8 +382,10 @@ data:
       if [[ "$backup_phase" == "Completed" ]]; then
         echo "[INFO] Backup $backup_name completed. Cleaning up reader pod."
         kubectl delete pod "$pod_name" -n "$ns" --ignore-not-found
+        restore_blank_dv_sources "$ns"
         patch_status "$name" "$ns" "Completed" "Backup ${backup_name} completed successfully"
       elif [[ "$backup_phase" == "Failed" || "$backup_phase" == "PartiallyFailed" ]]; then
+        restore_blank_dv_sources "$ns"
         patch_status "$name" "$ns" "Failed" "Velero backup ${backup_name} failed"
       fi
     }
