@@ -411,6 +411,8 @@ data:
       - persistentvolumes
       - configmaps
       - datavolumes
+      - virtualmachines
+      - virtualmachineinstances
       orLabelSelectors:
       - matchLabels:
           vmpvcbackup-cr: "${pod_name}"

@@ -1,61 +1,61 @@
-apiVersion: cdi.kubevirt.io/v1beta1
-kind: DataVolume
-metadata:
-  name: ubuntu-j-dv
-  namespace: ubuntu-ns
-spec:
-  source:
-    pvc:
-      namespace: ubuntu-ns
-      name: ubuntu-j-dv
-  storage:
-    accessModes:
-      - ReadWriteOnce
-    resources:
-      requests:
-        storage: 21Gi
----
-apiVersion: cdi.kubevirt.io/v1beta1
-kind: DataVolume
-metadata:
-  name: ubuntu-j-datadisk-1
-  namespace: ubuntu-ns
-spec:
-  source:
-    pvc:
-      namespace: ubuntu-ns
-      name: ubuntu-j-datadisk-1
-  storage:
-    accessModes:
-      - ReadWriteOnce
-    resources:
-      requests:
-        storage: 21Gi
----
-apiVersion: cdi.kubevirt.io/v1beta1
-kind: DataVolume
-metadata:
-  name: ubuntu-j-datadisk-2
-  namespace: ubuntu-ns
-spec:
-  source:
-    pvc:
-      namespace: ubuntu-ns
-      name: ubuntu-j-datadisk-2
-  storage:
-    accessModes:
-      - ReadWriteOnce
-    resources:
-      requests:
-        storage: 21Gi
----
+# apiVersion: cdi.kubevirt.io/v1beta1
+# kind: DataVolume
+# metadata:
+#   name: ubuntu-j-dv
+#   namespace: ubuntu-ns
+# spec:
+#   source:
+#     pvc:
+#       namespace: ubuntu-ns
+#       name: ubuntu-j-dv
+#   storage:
+#     accessModes:
+#       - ReadWriteOnce
+#     resources:
+#       requests:
+#         storage: 21Gi
+# ---
+# apiVersion: cdi.kubevirt.io/v1beta1
+# kind: DataVolume
+# metadata:
+#   name: ubuntu-j-datadisk-1
+#   namespace: ubuntu-ns
+# spec:
+#   source:
+#     pvc:
+#       namespace: ubuntu-ns
+#       name: ubuntu-j-datadisk-1
+#   storage:
+#     accessModes:
+#       - ReadWriteOnce
+#     resources:
+#       requests:
+#         storage: 21Gi
+# ---
+# apiVersion: cdi.kubevirt.io/v1beta1
+# kind: DataVolume
+# metadata:
+#   name: ubuntu-j-datadisk-2
+#   namespace: ubuntu-ns
+# spec:
+#   source:
+#     pvc:
+#       namespace: ubuntu-ns
+#       name: ubuntu-j-datadisk-2
+#   storage:
+#     accessModes:
+#       - ReadWriteOnce
+#     resources:
+#       requests:
+#         storage: 21Gi
+# ---
 apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
   name: ubuntu-j-vm
   namespace: ubuntu-ns
 spec:
-  running: false
+  running: true
   template:
     metadata:
       annotations:
