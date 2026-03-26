@@ -7,83 +7,149 @@ graph TB
     subgraph cluster["Kubernetes Cluster"]
 
         subgraph velero-ns["velero namespace"]
-            DEP["vmb Deployment<br/>(bitnami/kubectl container)"]
-            CM["controller.sh (ConfigMap)<br/>watches VMPVCBackup CRs<br/>creates reader pods<br/>triggers Velero backups<br/>cleans up on completion<br/>fixes stuck restore pods"]
+            DEP["vmb Deployment<br/>(bitnami/kubectl)"]
+            CM["controller.sh (ConfigMap)"]
             DEP --> CM
         end
 
-        subgraph vm-ns["VM namespace (e.g. default)"]
+        subgraph vm-ns["VM namespace"]
             CRD["VMPVCBackup CR"]
             VM["VirtualMachine"]
-            VMI["virt-launcher pod<br/>(running)"]
-            READER["reader pod<br/>(temporary)<br/>mounts PVCs"]
-            VMI -- "same node (preferred)" --> READER
+            VMI["virt-launcher pod"]
+            PVC["PVCs"]
+            READER["reader pod (temporary)"]
+            VMCM["ConfigMap (VM YAML export)"]
+            VM --> VMI
+            VMI --> PVC
+            READER -->|mounts| PVC
         end
 
-        READER -- "Velero FSB" --> OS
+        OS["Object Storage"]
 
+        CM -->|watches| CRD
+        CM -->|reads spec| VM
+        CM -->|discovers node| VMI
+        CM -->|creates| READER
+        CM -->|exports VM YAML| VMCM
+        READER -->|Velero FSB via node-agent| OS
     end
 
-    OS["Object Storage"]
-    USER["User"] -- "creates" --> CRD
+    READER -.-|same node as virt-launcher, preferred| VMI
+```
 
-    style cluster fill:none,stroke:#444,stroke-width:2px
-    style velero-ns fill:#e8f0fe,stroke:#4285f4,stroke-width:1px
-    style vm-ns fill:#e6f4ea,stroke:#34a853,stroke-width:1px
-    style READER fill:#fff3e0,stroke:#ff6d00,stroke-width:2px
-    style CRD fill:#fce4ec,stroke:#e91e63,stroke-width:2px
+## CR Status Phases
+
+```mermaid
+flowchart LR
+    A["Pending"] -->|VM running,<br/>node discovered| B["CreatingPod"]
+    A -->|VM not found<br/>or no PVCs| F["Failed"]
+    A -->|VM not running| A
+
+    B -->|reader pod submitted| C["WaitingForPod"]
+    B -->|pod creation failed| F
+
+    C -->|reader pod Running| D["BackingUp"]
+    C -->|pod stuck or timeout| F
+
+    D -->|Velero backup succeeded| E["Completed"]
+    D -->|Velero backup failed| F
 ```
 
 ## Backup Flow
 
 ```mermaid
 flowchart TD
-    A["User creates a VMPVCBackup CR<br/>vmName: my-vm &nbsp; backupName: my-backup"] --> B
+    U["User creates VMPVCBackup CR<br/>(vmName, backupName)"]
+    U --> POLL
 
-    B["1. DISCOVER<br/>Controller reads the VM spec and discovers:<br/>All PVCs (from persistentVolumeClaim + dataVolume volumes)<br/>The node where virt-launcher is running"] --> C
+    POLL["controller.sh polls every 20s<br/>Lists all VMPVCBackup CRs"]
+    POLL --> READ
 
-    C["2. CREATE READER POD<br/>A lightweight pod (ubuntu:22.04 / servercore:ltsc2022) is created with:<br/>All VM PVCs mounted as volumes<br/>Preferred node affinity → same node as virt-launcher<br/>backup.velero.io/backup-volumes annotation<br/>vmpvcbackup-cr label for Velero selection"] --> D
+    READ["Read CR spec<br/>Extract vmName, backupName, osType"]
+    READ --> DISC_PVC
 
-    D["3. LABEL RESOURCES<br/>PVCs and DataVolumes are labeled with vmpvcbackup-cr<br/>so Velero's orLabelSelectors picks them up<br/>as Kubernetes objects"] --> E
+    DISC_PVC["Discover PVCs from VM spec<br/>(persistentVolumeClaim + dataVolume volumes)"]
+    DISC_PVC --> DISC_NODE
 
-    E["4. SAVE VM DEFINITION<br/>The full VM YAML is exported to a ConfigMap (also labeled)<br/>so it can be recreated during restore without needing<br/>the virtualmachines resource in the Velero backup"] --> F
+    DISC_NODE["Discover node from virt-launcher pod<br/>(vm.kubevirt.io/name label, Running phase)"]
+    DISC_NODE --> CREATE
 
-    F["5. TRIGGER VELERO BACKUP<br/>A Velero Backup is created that selects resources by label:<br/>Reader pod → FSB writes PVC data to object storage<br/>PVCs / PVs → Kubernetes objects preserved<br/>DataVolumes → CDI metadata preserved<br/>ConfigMap → VM definition preserved"] --> G
+    CREATE["Phase: CreatingPod<br/>Create reader pod with:<br/>- All VM PVCs mounted<br/>- Preferred node affinity → same node as virt-launcher<br/>- backup.velero.io/backup-volumes annotation<br/>- vmpvcbackup-cr label"]
+    CREATE --> WAIT
 
-    G["6. CLEANUP<br/>Once Velero reports Completed or Failed:<br/>Reader pod is deleted<br/>VM YAML ConfigMap is deleted<br/>Backup labels are removed from PVCs / DataVolumes<br/>CR status is updated to Completed / Failed"]
+    WAIT["Phase: WaitingForPod<br/>Poll pod phase every 5s<br/>(up to 300s timeout)"]
+    WAIT --> SAVE
 
-    style A fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style G fill:#e6f4ea,stroke:#34a853,stroke-width:2px
+    SAVE["Save VM YAML to ConfigMap<br/>Labeled: vmpvcbackup-cr + vmpvcbackup-vm-export=true"]
+    SAVE --> TRIGGER
+
+    TRIGGER["Phase: BackingUp<br/>Create Velero Backup<br/>- orLabelSelectors: vmpvcbackup-cr<br/>- defaultVolumesToFsBackup: true<br/>- snapshotVolumes: false"]
+    TRIGGER --> RESULT
+
+    RESULT{"Velero Backup<br/>phase?"}
+    RESULT -->|Completed| CLEANUP_OK
+    RESULT -->|Failed / PartiallyFailed| CLEANUP_FAIL
+    RESULT -->|In Progress| POLL
+
+    CLEANUP_OK["Phase: Completed<br/>Delete reader pod<br/>Delete VM YAML ConfigMap"]
+    CLEANUP_FAIL["Phase: Failed<br/>Delete reader pod<br/>Delete VM YAML ConfigMap<br/>Log Velero error details"]
 ```
 
 ## Restore Flow
 
 ```mermaid
 flowchart TD
-    A["1. CREATE VELERO RESTORE<br/>velero restore create --from-backup backup-name<br/>--restore-volumes=true<br/>--namespace-mappings original-ns:target-ns (optional)"] --> B
+    A["User: velero restore create<br/>--from-backup backup-name<br/>--restore-volumes=true<br/>--namespace-mappings original-ns:target-ns (optional)"]
+    A --> B
 
-    B["2. WAIT FOR PVC DATA<br/>Velero recreates:<br/>PVCs / PVs / DataVolumes (Kubernetes objects)<br/>Reader pod (triggers PodVolumeRestore)<br/>ConfigMap (VM definition)<br/>PodVolumeRestores write data back into PVCs<br/>via the reader pod's volume mounts"] --> C
+    B["Velero recreates:<br/>- Reader pod (triggers PodVolumeRestore)<br/>- ConfigMap (VM definition)"]
+    B --> C
 
-    C["3. RECREATE VM<br/>Extract VM YAML from the restored ConfigMap and apply:<br/>kubectl get cm -l vmpvcbackup-vm-export=true -n ns<br/>-o jsonpath | kubectl apply -f -"] --> D
+    C["PodVolumeRestores write data<br/>back into PVCs via the<br/>reader pod's volume mounts"]
+    C --> D
 
-    D["4. CLEANUP & START<br/>Delete restored reader pod<br/>Delete restored ConfigMap<br/>Start VM: virtctl start vm-name -n ns"]
+    D["User: Extract VM YAML from ConfigMap<br/>kubectl get cm -l vmpvcbackup-vm-export=true<br/>-o jsonpath | kubectl apply -f -"]
+    D --> E
 
-    style A fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style D fill:#e6f4ea,stroke:#34a853,stroke-width:2px
+    E["User: Cleanup and start<br/>- Delete restored reader pod<br/>- Delete restored ConfigMap<br/>- virtctl start vm-name"]
 ```
 
 ## Cross-Cluster Restore
 
 ```mermaid
 flowchart TD
-    A["Restoring to a different cluster"] --> B
-    B["Reader pod's node affinity references<br/>a node that doesn't exist"] --> C
-    C["Pod gets stuck in Pending<br/>with a FailedScheduling event"] --> D
-    D["VMPVCBackup controller<br/>(running on target cluster)<br/>automatically detects this"] --> E
-    E["Controller recreates the reader pod<br/>without the node constraint"] --> F
-    F["PodVolumeRestores proceed"]
+    A["Velero restore creates reader pod<br/>on target cluster"] --> B{"Reader pod<br/>status?"}
 
-    style C fill:#fff3e0,stroke:#ff6d00,stroke-width:2px
-    style D fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style F fill:#e6f4ea,stroke:#34a853,stroke-width:2px
+    B -->|Running| OK["PodVolumeRestore<br/>proceeds normally"]
+
+    B -->|Pending| C{"Age ><br/>RESTORE_PENDING_THRESHOLD<br/>(30s)?"}
+    C -->|No| WAIT["Skip — give it time<br/>to schedule normally"]
+    C -->|Yes| D{"Has velero.io/restore-name<br/>label?"}
+    D -->|No| SKIP1["Skip — not a<br/>restore artifact"]
+    D -->|Yes| E{"FailedScheduling<br/>event?"}
+    E -->|No| SKIP2["Skip — may still<br/>schedule normally"]
+    E -->|Yes| F["Controller detects stuck pod"]
+    F --> G["Extract PVC list and<br/>container image from pod"]
+    G --> H["Delete stuck pod"]
+    H --> I["Recreate reader pod<br/>WITHOUT node affinity"]
+    I --> OK
+
+    OK --> J["User extracts VM YAML from ConfigMap,<br/>applies it, and starts the VM"]
+```
+
+## Main Reconciliation Loop
+
+```mermaid
+flowchart TD
+    START["Controller starts<br/>(poll interval: 20s)"] --> LIST
+
+    LIST["List all VMPVCBackup CRs<br/>across all namespaces"] --> RECONCILE
+
+    RECONCILE["Reconcile each CR<br/>(skip Completed / Failed)"] --> RESTORE
+
+    RESTORE["fix_stuck_restore_pods<br/>Detect and recreate Pending reader pods<br/>from cross-cluster restores<br/>that have FailedScheduling events"] --> ORPHAN
+
+    ORPHAN["cleanup_orphaned_reader_pods<br/>Delete reader pods whose CR is<br/>Completed, Failed, or deleted"] --> SLEEP
+
+    SLEEP["Sleep POLL_INTERVAL (20s)"] --> LIST
 ```

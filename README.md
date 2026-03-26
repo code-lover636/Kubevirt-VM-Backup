@@ -76,40 +76,30 @@ Velero's file-system backup (FSB) requires a **running pod** with the PVC mounte
 └──────────────────────┬───────────────────────────────────────────┘
                        ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ 3. LABEL RESOURCES                                               │
-│    PVCs and DataVolumes are labeled with vmpvcbackup-cr so       │
-│    Velero's orLabelSelectors picks them up as Kubernetes objects  │
+│ 3. SAVE VM DEFINITION                                            │
+│    The full VM YAML is exported to a ConfigMap (also labeled     │
+│    with vmpvcbackup-cr) so it can be recreated during restore    │
 └──────────────────────┬───────────────────────────────────────────┘
                        ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ 4. SAVE VM DEFINITION                                            │
-│    The full VM YAML is exported to a ConfigMap (also labeled)    │
-│    so it can be recreated during restore without needing the     │
-│    virtualmachines resource in the Velero backup                 │
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 5. TRIGGER VELERO BACKUP                                         │
+│ 4. TRIGGER VELERO BACKUP                                         │
 │    A Velero Backup is created that selects resources by label:   │
 │    • Reader pod     → FSB writes PVC data to object storage     │
-│    • PVCs / PVs     → Kubernetes objects preserved               │
-│    • DataVolumes    → CDI metadata preserved                     │
 │    • ConfigMap      → VM definition preserved                    │
 └──────────────────────┬───────────────────────────────────────────┘
                        ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ 6. CLEANUP                                                       │
+│ 5. CLEANUP                                                       │
 │    Once Velero reports Completed or Failed:                      │
 │    • Reader pod is deleted                                       │
 │    • VM YAML ConfigMap is deleted                                │
-│    • Backup labels are removed from PVCs / DataVolumes           │
 │    • CR status is updated to Completed / Failed                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Restore Flow
 
-Since the Velero backup contains the reader pod (with PVC data), the PVC/PV objects, DataVolumes, and the VM definition ConfigMap, the restore process is:
+Since the Velero backup contains the reader pod (with PVC data) and the VM definition ConfigMap, the restore process is:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -122,7 +112,6 @@ Since the Velero backup contains the reader pod (with PVC data), the PVC/PV obje
 ┌──────────────────────────────────────────────────────────────────┐
 │ 2. WAIT FOR PVC DATA                                             │
 │    Velero recreates:                                             │
-│    • PVCs / PVs / DataVolumes (Kubernetes objects)               │
 │    • Reader pod (triggers PodVolumeRestore)                      │
 │    • ConfigMap (VM definition)                                   │
 │    PodVolumeRestores write data back into PVCs via the reader    │
@@ -409,11 +398,11 @@ Registers the `VMPVCBackup` custom resource in the `backup.kubevirt.io` API grou
 
 The controller runs as the `vmb` ServiceAccount in the `velero` namespace. The ClusterRole grants it permission to:
 
-- **Read** VMPVCBackup CRs and **update** their status subresource
-- **Create and delete** pods (reader pods) and ConfigMaps (VM YAML export)
-- **Get, list, patch** PVCs and DataVolumes (for labeling so Velero selects them)
-- **Get and list** VirtualMachines and VirtualMachineInstances (for discovering PVCs and node)
-- **Create and watch** Velero Backups and Restores
+- **Get, list, watch** VMPVCBackup CRs and **update, patch** their status subresource
+- **Get, list, create, delete, watch** pods (reader pods), PVCs, and ConfigMaps (VM YAML export)
+- **Get, list, patch** VirtualMachines and VirtualMachineInstances (for discovering PVCs and node)
+- **Get, list** DataVolumes (CDI metadata)
+- **Get, list, watch, create** Velero Backups, Restores, and PodVolumeRestores
 
 The ClusterRoleBinding binds this role to the `vmb` ServiceAccount across all namespaces.
 
@@ -460,12 +449,6 @@ Generates the `backup.velero.io/backup-volumes` annotation value. For 3 PVCs thi
 **`build_volume_mounts(os_type, pvcs...)`** and **`build_volumes(pvcs...)`**
 Generate the YAML fragments for `volumeMounts` and `volumes` sections of the reader pod spec. Linux PVCs are mounted at `/data1`, `/data2`, etc. Windows PVCs at `C:/data1`, `C:/data2`, etc.
 
-**`label_backup_resources(pod_name, ns, pvcs...)`**
-Adds the `vmpvcbackup-cr=<pod_name>` label to every PVC and its corresponding DataVolume (if it exists). This label is what Velero's `orLabelSelectors` matches to include these resources in the backup.
-
-**`unlabel_backup_resources(pod_name, ns, pvcs...)`**
-Removes the `vmpvcbackup-cr` label from PVCs and DataVolumes after the backup completes or fails. Keeps the cluster clean.
-
 **`create_reader_pod(pod_name, ns, os_type, target_node, pvcs...)`**
 Creates the temporary reader pod with:
 - All VM PVCs mounted
@@ -482,7 +465,7 @@ Polls the pod phase every 5 seconds up to `POD_READY_TIMEOUT`. Returns 0 on Runn
 Checks if the reader pod actually landed on the expected node. Logs a warning if it didn't (which can happen with RWX PVCs) but continues anyway since RWO PVCs enforce co-location by nature.
 
 **`save_vm_yaml(vm_name, ns, cr_name, pod_name)`**
-Exports the complete VirtualMachine YAML to a ConfigMap named `vm-backup-<cr_name>`. This ConfigMap is labeled with `vmpvcbackup-cr` (so Velero includes it) and `vmpvcbackup-vm-export=true` (so the restore process can find it). This avoids including `virtualmachines` in Velero's `includedResources`, which would trigger kubevirt-velero-plugin errors.
+Exports the complete VirtualMachine YAML to a ConfigMap named `vm-backup-<cr_name>`. This ConfigMap is labeled with `vmpvcbackup-cr` (so Velero includes it) and `vmpvcbackup-vm-export=true` (so the restore process can find it).
 
 **`cleanup_vm_yaml(cr_name, ns)`**
 Deletes the VM YAML ConfigMap after the backup finishes.
@@ -490,7 +473,7 @@ Deletes the VM YAML ConfigMap after the backup finishes.
 **`trigger_velero_backup(backup_name, ns, pod_name, cr_name)`**
 Creates a Velero Backup object with:
 - `includedNamespaces` — the VM's namespace
-- `includedResources` — namespaces, pods, PVCs, PVs, ConfigMaps, DataVolumes
+- `includedResources` — namespaces, pods, PVCs, PVs, ConfigMaps, DataVolumes, VirtualMachines, VirtualMachineInstances
 - `orLabelSelectors` — `vmpvcbackup-cr: <pod_name>` (only backs up resources with this label)
 - `defaultVolumesToFsBackup: true` — use file-system backup for all annotated volumes
 - `snapshotVolumes: false` — no CSI snapshots
@@ -499,15 +482,7 @@ Creates a Velero Backup object with:
 On backup failure, prints detailed diagnostic information: failure reason, warning/error counts, and the last 50 lines of Velero server logs filtered to the backup name.
 
 **`delete_reader_pod(pod_name, ns, reason)`**
-Deletes the reader pod with `--grace-period=30`. The reason parameter is logged for debugging.
-
-**`handle_backup_result(name, ns, backup_name, pod_name, pvcs...)`**
-Checks the Velero backup phase and handles terminal states:
-- **Completed** → deletes reader pod, cleans up ConfigMap, removes labels, patches CR to Completed
-- **Failed / PartiallyFailed** → same cleanup, patches CR to Failed with error details
-- **Anything else** → logs progress, returns 1 (not terminal, keep polling)
-
-This function is the key fix for the reader-pod-not-deleted bug. By extracting it, it can be called both from the main reconcile path and from the early-exit path when the VM is no longer running.
+Deletes the reader pod with `--ignore-not-found --wait=false`. The reason parameter is logged for debugging.
 
 ### Core Reconcile Logic
 
@@ -517,14 +492,13 @@ This function is the key fix for the reader-pod-not-deleted bug. By extracting i
 2. **Read spec** — extract vmName, backupName, osType from the CR.
 3. **Verify VM exists** — fail if the VirtualMachine object isn't found.
 4. **Discover PVCs** — fail if no PVCs are found on the VM.
-5. **Check existing backup** — if a Velero Backup already exists for this CR, jump directly to `handle_backup_result`. This is critical: it ensures cleanup happens even if the VM has been shut down since the backup started.
-6. **Discover node** — find which node the VM is running on. If the VM isn't running, stay in Pending and retry next cycle.
-7. **Create or reuse reader pod** — if a reader pod already exists on the correct node and is Running, reuse it. If it's on the wrong node or in a failed state, delete and recreate.
-8. **Wait for pod** — poll until the reader pod is Running or timeout.
-9. **Label resources** — add backup label to PVCs and DataVolumes.
-10. **Save VM YAML** — export VM definition to ConfigMap.
-11. **Trigger Velero backup** — create the Backup object.
-12. **Handle result** — check if the backup has already completed (fast backups) or leave for next polling cycle.
+5. **Discover node** — find which node the VM is running on. If the VM isn't running, stay in Pending and retry next cycle.
+6. **Create or reuse reader pod** — if a reader pod already exists on the correct node and is Running, reuse it. If it's on the wrong node or in a failed state, delete and recreate.
+7. **Wait for pod** — poll until the reader pod is Running or timeout.
+8. **Verify pod node** — confirm the reader pod landed on the expected node (logs a warning if not).
+9. **Save VM YAML** — export VM definition to ConfigMap.
+10. **Trigger Velero backup** — create the Backup object (skipped if backup already exists).
+11. **Handle result** — check the Velero backup phase: on Completed or Failed, delete reader pod, clean up ConfigMap, and patch CR status. Otherwise, leave for next polling cycle.
 
 ### Restore Assist — fix_stuck_restore_pods
 
@@ -608,7 +582,7 @@ kubectl logs -n velero -l app=vmb --tail=100
 ```
 
 **Reader pod not deleted after backup**
-Ensure you're running the latest version of the controller. The fix ensures `handle_backup_result` is called even when the VM is stopped during backup.
+Ensure you're running the latest version of the controller. The orphan sweep (`cleanup_orphaned_reader_pods`) automatically removes reader pods whose CR is Completed, Failed, or deleted.
 
 **Restore: reader pod stuck in Pending on target cluster**
 Ensure the VMPVCBackup controller is deployed on the target cluster. It automatically recreates stuck pods without node constraints.
