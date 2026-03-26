@@ -1,0 +1,8 @@
+apiVersion: backup.kubevirt.io/v1alpha1
+kind: VMPVCBackup
+metadata:
+  name: backup-ubuntu-crd-1
+  namespace: j-vms-5
+spec:
+  vmName: ubuntu-j-vm
+  backupName: ubuntu-j-backup-1
