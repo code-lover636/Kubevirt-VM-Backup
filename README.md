@@ -152,6 +152,8 @@ When restoring to a **different cluster**, the reader pod's node affinity refere
 
 ## Architecture Diagram
 
+> Detailed Mermaid diagrams (cluster architecture, backup flow, restore flow, cross-cluster restore) are available in [docs/architecture.md](docs/architecture.md). GitHub renders them automatically.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Kubernetes Cluster                           │
