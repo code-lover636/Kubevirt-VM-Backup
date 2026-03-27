@@ -7,7 +7,7 @@ A Kubernetes-native controller and CRD for backing up and restoring **running Ku
 ## Table of Contents
 
 - [The Problem](#the-problem)
-- [How It Works](#how-it-works)
+- [How It Works](#architecture-diagram)
   - [Backup Flow](#backup-flow)
   - [Restore Flow](#restore-flow)
   - [Cross-Cluster Restore](#cross-cluster-restore)
@@ -48,135 +48,162 @@ Velero's file-system backup (FSB) requires a **running pod** with the PVC mounte
 
 ---
 
-## How It Works
+## Architecture Diagram
+
+### Cluster Architecture
+
+```mermaid
+graph TB
+    subgraph cluster["Kubernetes Cluster"]
+
+        subgraph velero-ns["velero namespace"]
+            DEP["vmb Deployment<br/>(bitnami/kubectl)"]
+            CM["controller.sh (ConfigMap)"]
+            DEP --> CM
+        end
+
+        subgraph vm-ns["VM namespace"]
+            CRD["VMPVCBackup CR"]
+            VM["VirtualMachine"]
+            VMI["virt-launcher pod"]
+            PVC["PVCs"]
+            READER["reader pod (temporary)"]
+            VMCM["ConfigMap (VM YAML export)"]
+            VM --> VMI
+            VMI --> PVC
+            READER -->|mounts| PVC
+        end
+
+        OS["Object Storage"]
+
+        CM -->|watches| CRD
+        CM -->|reads spec| VM
+        CM -->|discovers node| VMI
+        CM -->|creates| READER
+        CM -->|exports VM YAML| VMCM
+        READER -->|Velero FSB via node-agent| OS
+    end
+
+    READER -.-|same node as virt-launcher, preferred| VMI
+```
+
+### CR Status Phases
+
+```mermaid
+flowchart LR
+    A["Pending"] -->|VM running,<br/>node discovered| B["CreatingPod"]
+    A -->|VM not found<br/>or no PVCs| F["Failed"]
+    A -->|VM not running| A
+
+    B -->|reader pod submitted| C["WaitingForPod"]
+    B -->|pod creation failed| F
+
+    C -->|reader pod Running| D["BackingUp"]
+    C -->|pod stuck or timeout| F
+
+    D -->|Velero backup succeeded| E["Completed"]
+    D -->|Velero backup failed| F
+```
 
 ### Backup Flow
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ User creates a VMPVCBackup CR                                    │
-│   vmName: my-vm   backupName: my-backup                          │
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 1. DISCOVER                                                      │
-│    Controller reads the VM spec and discovers:                   │
-│    • All PVCs (from persistentVolumeClaim + dataVolume volumes)  │
-│    • The node where virt-launcher is running                     │
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 2. CREATE READER POD                                             │
-│    A lightweight pod (ubuntu:22.04 / servercore:ltsc2022) is     │
-│    created with:                                                 │
-│    • All VM PVCs mounted as volumes                              │
-│    • Preferred node affinity → same node as virt-launcher        │
-│    • backup.velero.io/backup-volumes annotation                  │
-│    • vmpvcbackup-cr label for Velero selection                   │
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 3. SAVE VM DEFINITION                                            │
-│    The full VM YAML is exported to a ConfigMap (also labeled     │
-│    with vmpvcbackup-cr) so it can be recreated during restore    │
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 4. TRIGGER VELERO BACKUP                                         │
-│    A Velero Backup is created that selects resources by label:   │
-│    • Reader pod     → FSB writes PVC data to object storage     │
-│    • ConfigMap      → VM definition preserved                    │
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 5. CLEANUP                                                       │
-│    Once Velero reports Completed or Failed:                      │
-│    • Reader pod is deleted                                       │
-│    • VM YAML ConfigMap is deleted                                │
-│    • CR status is updated to Completed / Failed                  │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    U["User creates VMPVCBackup CR<br/>(vmName, backupName)"]
+    U --> POLL
+
+    POLL["controller.sh polls every 20s<br/>Lists all VMPVCBackup CRs"]
+    POLL --> READ
+
+    READ["Read CR spec<br/>Extract vmName, backupName, osType"]
+    READ --> DISC_PVC
+
+    DISC_PVC["Discover PVCs from VM spec<br/>(persistentVolumeClaim + dataVolume volumes)"]
+    DISC_PVC --> DISC_NODE
+
+    DISC_NODE["Discover node from virt-launcher pod<br/>(vm.kubevirt.io/name label, Running phase)"]
+    DISC_NODE --> CREATE
+
+    CREATE["Phase: CreatingPod<br/>Create reader pod with:<br/>- All VM PVCs mounted<br/>- Preferred node affinity → same node as virt-launcher<br/>- backup.velero.io/backup-volumes annotation<br/>- vmpvcbackup-cr label"]
+    CREATE --> WAIT
+
+    WAIT["Phase: WaitingForPod<br/>Poll pod phase every 5s<br/>(up to 300s timeout)"]
+    WAIT --> SAVE
+
+    SAVE["Save VM YAML to ConfigMap<br/>Labeled: vmpvcbackup-cr + vmpvcbackup-vm-export=true"]
+    SAVE --> TRIGGER
+
+    TRIGGER["Phase: BackingUp<br/>Create Velero Backup<br/>- orLabelSelectors: vmpvcbackup-cr<br/>- defaultVolumesToFsBackup: true<br/>- snapshotVolumes: false"]
+    TRIGGER --> RESULT
+
+    RESULT{"Velero Backup<br/>phase?"}
+    RESULT -->|Completed| CLEANUP_OK
+    RESULT -->|Failed / PartiallyFailed| CLEANUP_FAIL
+    RESULT -->|In Progress| POLL
+
+    CLEANUP_OK["Phase: Completed<br/>Delete reader pod<br/>Delete VM YAML ConfigMap"]
+    CLEANUP_FAIL["Phase: Failed<br/>Delete reader pod<br/>Delete VM YAML ConfigMap<br/>Log Velero error details"]
 ```
 
 ### Restore Flow
 
-Since the Velero backup contains the reader pod (with PVC data) and the VM definition ConfigMap, the restore process is:
+```mermaid
+flowchart TD
+    A["User: velero restore create<br/>--from-backup backup-name<br/>--restore-volumes=true<br/>--namespace-mappings original-ns:target-ns (optional)"]
+    A --> B
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ 1. CREATE VELERO RESTORE                                         │
-│    velero restore create --from-backup <backup-name>             │
-│    --restore-volumes=true                                        │
-│    [--namespace-mappings original-ns:target-ns]                  │
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 2. WAIT FOR PVC DATA                                             │
-│    Velero recreates:                                             │
-│    • Reader pod (triggers PodVolumeRestore)                      │
-│    • ConfigMap (VM definition)                                   │
-│    PodVolumeRestores write data back into PVCs via the reader    │
-│    pod's volume mounts.                                          │
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 3. RECREATE VM                                                   │
-│    Extract VM YAML from the restored ConfigMap and apply:        │
-│    kubectl get cm -l vmpvcbackup-vm-export=true -n <ns> \       │
-│      -o jsonpath='{.items[0].data.vm\.yaml}' | kubectl apply -f-│
-└──────────────────────┬───────────────────────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ 4. CLEANUP & START                                               │
-│    • Delete restored reader pod                                  │
-│    • Delete restored ConfigMap                                   │
-│    • Start VM: virtctl start <vm-name> -n <ns>                  │
-└──────────────────────────────────────────────────────────────────┘
+    B["Velero recreates:<br/>- Reader pod (triggers PodVolumeRestore)<br/>- ConfigMap (VM definition)"]
+    B --> C
+
+    C["PodVolumeRestores write data<br/>back into PVCs via the<br/>reader pod's volume mounts"]
+    C --> D
+
+    D["User: Extract VM YAML from ConfigMap<br/>kubectl get cm -l vmpvcbackup-vm-export=true<br/>-o jsonpath | kubectl apply -f -"]
+    D --> E
+
+    E["User: Cleanup and start<br/>- Delete restored reader pod<br/>- Delete restored ConfigMap<br/>- virtctl start vm-name"]
 ```
 
 ### Cross-Cluster Restore
 
-When restoring to a **different cluster**, the reader pod's node affinity references a node that doesn't exist. The pod gets stuck in `Pending` with a `FailedScheduling` event. The VMPVCBackup controller (which must be running on the target cluster) **automatically detects** this and recreates the reader pod without the node constraint, allowing PodVolumeRestores to proceed.
+```mermaid
+flowchart TD
+    A["Velero restore creates reader pod<br/>on target cluster"] --> B{"Reader pod<br/>status?"}
 
----
+    B -->|Running| OK["PodVolumeRestore<br/>proceeds normally"]
 
-## Architecture Diagram
+    B -->|Pending| C{"Age ><br/>RESTORE_PENDING_THRESHOLD<br/>(30s)?"}
+    C -->|No| WAIT["Skip — give it time<br/>to schedule normally"]
+    C -->|Yes| D{"Has velero.io/restore-name<br/>label?"}
+    D -->|No| SKIP1["Skip — not a<br/>restore artifact"]
+    D -->|Yes| E{"FailedScheduling<br/>event?"}
+    E -->|No| SKIP2["Skip — may still<br/>schedule normally"]
+    E -->|Yes| F["Controller detects stuck pod"]
+    F --> G["Extract PVC list and<br/>container image from pod"]
+    G --> H["Delete stuck pod"]
+    H --> I["Recreate reader pod<br/>WITHOUT node affinity"]
+    I --> OK
 
-> Detailed Mermaid diagrams (cluster architecture, backup flow, restore flow, cross-cluster restore) are available in [docs/architecture.md](docs/architecture.md). GitHub renders them automatically.
-
+    OK --> J["User extracts VM YAML from ConfigMap,<br/>applies it, and starts the VM"]
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Kubernetes Cluster                           │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │ velero namespace                                            │ │
-│  │                                                             │ │
-│  │  ┌─────────────────┐     ┌──────────────────────────────┐  │ │
-│  │  │ vmb Deployment  │────▶│ controller.sh (ConfigMap)     │  │ │
-│  │  │ (bitnami/kubectl│     │ • watches VMPVCBackup CRs    │  │ │
-│  │  │  container)     │     │ • creates reader pods        │  │ │
-│  │  └─────────────────┘     │ • triggers Velero backups    │  │ │
-│  │                          │ • cleans up on completion    │  │ │
-│  │                          │ • fixes stuck restore pods   │  │ │
-│  │                          └──────────────────────────────┘  │ │
-│  └────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │ vm namespace (e.g. default)                                 │ │
-│  │                                                             │ │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐  │ │
-│  │  │ VMPVCBackup  │  │ VirtualMachine│  │ virt-launcher   │  │ │
-│  │  │ CR           │  │              │  │ pod (running)   │  │ │
-│  │  └──────┬───────┘  └──────────────┘  └────────┬────────┘  │ │
-│  │         │                                      │           │ │
-│  │         ▼                                      │           │ │
-│  │  ┌──────────────┐                              │           │ │
-│  │  │ reader pod   │◀─── same node (preferred) ───┘           │ │
-│  │  │ (temporary)  │                                          │ │
-│  │  │ mounts PVCs  │──── Velero FSB ──── Object Storage      │ │
-│  │  └──────────────┘                                          │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+
+## Main Reconciliation Loop
+
+```mermaid
+flowchart TD
+    START["Controller starts<br/>(poll interval: 20s)"] --> LIST
+
+    LIST["List all VMPVCBackup CRs<br/>across all namespaces"] --> RECONCILE
+
+    RECONCILE["Reconcile each CR<br/>(skip Completed / Failed)"] --> RESTORE
+
+    RESTORE["fix_stuck_restore_pods<br/>Detect and recreate Pending reader pods<br/>from cross-cluster restores<br/>that have FailedScheduling events"] --> ORPHAN
+
+    ORPHAN["cleanup_orphaned_reader_pods<br/>Delete reader pods whose CR is<br/>Completed, Failed, or deleted"] --> SLEEP
+
+    SLEEP["Sleep POLL_INTERVAL (20s)"] --> LIST
 ```
+
 
 ---
 
@@ -184,9 +211,9 @@ When restoring to a **different cluster**, the reader pod's node affinity refere
 
 | Requirement | Details |
 |---|---|
-| **Kubernetes** | v1.24+ |
-| **KubeVirt** | v0.58+ (tested up to v1.4) |
-| **Velero** | v1.12+ with a file-system backup provider (restic or kopia) |
+| **Kubernetes** |  |
+| **KubeVirt** |  |
+| **Velero** | with a file-system backup provider (restic or kopia) |
 | **Velero node-agent** | DaemonSet must be running (`velero install --use-node-agent`) |
 | **kubectl** | Available on the machine where you apply manifests |
 | **virtctl** | (Optional) For starting/stopping VMs |
@@ -273,7 +300,7 @@ kubectl get vmi -n <namespace>
 apiVersion: backup.kubevirt.io/v1alpha1
 kind: VMPVCBackup
 metadata:
-  name: myvm-backup-1
+  name: myvm-backup-1         # name of the CR
   namespace: default          # must match the VM's namespace
 spec:
   vmName: my-linux-vm         # name of the VirtualMachine object
@@ -284,21 +311,11 @@ spec:
 kubectl apply -f backup-cr.yaml
 ```
 
-**3. Watch the progress:**
-
+**3. Watch the logs:**
 ```bash
-kubectl get vmpvcbackup -n default -w
+kubectl logs -n velero -l app=vmb -f
 ```
 
-Output:
-
-```
-NAME            PHASE        POD                  NODE      PVCS                        BACKUP
-myvm-backup-1   CreatingPod  reader-myvm-backup-1  node-01  pvc-root pvc-data           myvm-velero-1
-myvm-backup-1   WaitingForPod ...
-myvm-backup-1   BackingUp    ...
-myvm-backup-1   Completed    ...
-```
 
 ### Backup a Windows VM
 
@@ -332,7 +349,6 @@ velero backup describe myvm-velero-1 --details
 
 ### Restore
 
-**Same-cluster, same-namespace restore:**
 
 ```bash
 # Step 1 — Create Velero restore
@@ -345,47 +361,9 @@ kubectl get podvolumerestores -n velero -w
 kubectl get configmap -n default -l vmpvcbackup-vm-export=true \
   -o jsonpath='{.items[0].data.vm\.yaml}' | kubectl apply -f -
 
-# Step 4 — Clean up restored reader pod and ConfigMap
-kubectl delete pod -n default -l app=vmpvcbackup-reader
-kubectl delete configmap -n default -l vmpvcbackup-vm-export=true
-
-# Step 5 — Start the VM
+# Step 4 — Start the VM
 virtctl start my-linux-vm -n default
 ```
-
-**Cross-namespace restore:**
-
-```bash
-# Step 1 — Create target namespace
-kubectl create namespace restore-ns
-
-# Step 2 — Restore with namespace mapping
-velero restore create --from-backup myvm-velero-1 \
-  --restore-volumes=true \
-  --namespace-mappings default:restore-ns \
-  --wait
-
-# Step 3 — Wait for PodVolumeRestores
-kubectl get podvolumerestores -n velero -w
-
-# Step 4 — Extract VM YAML, fix namespace, and apply
-kubectl get configmap -n restore-ns -l vmpvcbackup-vm-export=true \
-  -o jsonpath='{.items[0].data.vm\.yaml}' \
-  | sed 's/namespace: default/namespace: restore-ns/g' \
-  | kubectl apply -f -
-
-# Step 5 — Clean up
-kubectl delete pod -n restore-ns -l app=vmpvcbackup-reader
-kubectl delete configmap -n restore-ns -l vmpvcbackup-vm-export=true
-
-# Step 6 — Start
-virtctl start my-linux-vm -n restore-ns
-```
-
-**Cross-cluster restore:**
-
-Same as cross-namespace, but ensure the VMPVCBackup controller is also deployed on the target cluster. It will automatically detect and fix reader pods that are stuck in `Pending` due to the original node not existing.
-
 ---
 
 ## Resource Reference
