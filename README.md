@@ -6,6 +6,7 @@ A Kubernetes-native controller and CRD for backing up and restoring **running Ku
 
 ## Table of Contents
 
+
 - [The Problem](#the-problem)
 - [How It Works](#architecture-diagram)
   - [Backup Flow](#backup-flow)
@@ -33,7 +34,6 @@ A Kubernetes-native controller and CRD for backing up and restoring **running Ku
   - [Main Loop](#main-loop)
 - [CR Spec Reference](#cr-spec-reference)
 - [Status Fields](#status-fields)
-- [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
 
 ---
@@ -398,9 +398,8 @@ A single-replica Deployment in the `velero` namespace that runs the `bitnami/kub
 
 The controller is a polling-based reconciliation loop written in Bash. Every 20 seconds it lists all VMPVCBackup CRs, reconciles each one, then runs restore-assist and orphan cleanup.
 
-# VMPVCBackup Controller — Function Documentation
 
-## Global Variables
+### Global Variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -409,9 +408,9 @@ The controller is a polling-based reconciliation loop written in Bash. Every 20 
 
 ---
 
-## Utility Functions
+### Utility Functions
 
-### `log(level, message)`
+#### `log(level, message)`
 
 Prints a timestamped log line to stdout.
 
@@ -427,7 +426,7 @@ Prints a timestamped log line to stdout.
 
 ---
 
-### `set_status(name, ns, phase, msg)`
+#### `set_status(name, ns, phase, msg)`
 
 Patches the `.status.phase` and `.status.message` fields on a VMPVCBackup CR using a JSON merge patch on the status subresource.
 
@@ -442,9 +441,9 @@ Patches the `.status.phase` and `.status.message` fields on a VMPVCBackup CR usi
 
 ---
 
-## Discovery Functions
+### Discovery Functions
 
-### `get_vm_pvcs(vm, ns)`
+#### `get_vm_pvcs(vm, ns)`
 
 Discovers all PVCs attached to a VirtualMachine by reading its spec.
 
@@ -463,7 +462,7 @@ Combines both, removes duplicates with `sort -u`, and returns the result.
 
 ---
 
-### `get_vm_node(vm, ns)`
+#### `get_vm_node(vm, ns)`
 
 Finds the Kubernetes node where the VM is currently running.
 
@@ -478,9 +477,9 @@ Finds the Kubernetes node where the VM is currently running.
 
 ---
 
-## Resource Labeling Functions
+### Resource Labeling Functions
 
-### `label_resources(label, ns, pvcs...)`
+#### `label_resources(label, ns, pvcs...)`
 
 Adds the `vmpvcbackup-cr=<label>` label to PVCs and their corresponding DataVolumes. This label is what Velero's `orLabelSelectors` matches to include these resources in the backup.
 
@@ -494,7 +493,7 @@ Adds the `vmpvcbackup-cr=<label>` label to PVCs and their corresponding DataVolu
 
 ---
 
-### `unlabel_resources(ns, pvcs...)`
+#### `unlabel_resources(ns, pvcs...)`
 
 Removes the `vmpvcbackup-cr` label from PVCs and DataVolumes after backup completes or fails.
 
@@ -507,9 +506,9 @@ Removes the `vmpvcbackup-cr` label from PVCs and DataVolumes after backup comple
 
 ---
 
-## VM YAML Preservation Functions
+### VM YAML Preservation Functions
 
-### `save_vm_configmap(vm, ns, label)`
+#### `save_vm_configmap(vm, ns, label)`
 
 Exports the full VirtualMachine YAML to a ConfigMap so it can be restored without including `virtualmachines` in Velero's `includedResources` (which would trigger kubevirt-velero-plugin errors on running VMs).
 
@@ -528,7 +527,7 @@ Exports the full VirtualMachine YAML to a ConfigMap so it can be restored withou
 
 ---
 
-### `delete_vm_configmap(label, ns)`
+#### `delete_vm_configmap(label, ns)`
 
 Deletes the VM YAML ConfigMap after backup completes.
 
@@ -541,9 +540,9 @@ Deletes the VM YAML ConfigMap after backup completes.
 
 ---
 
-## Reader Pod Functions
+### Reader Pod Functions
 
-### `create_reader_pod(pod, ns, os, node, pvcs...)`
+#### `create_reader_pod(pod, ns, os, node, pvcs...)`
 
 Creates a temporary pod that mounts all VM PVCs so Velero can perform file-system backup through it.
 
@@ -574,7 +573,7 @@ Creates a temporary pod that mounts all VM PVCs so Velero can perform file-syste
 
 ---
 
-### `wait_pod_running(pod, ns)`
+#### `wait_pod_running(pod, ns)`
 
 Polls the pod phase every 5 seconds until it reaches `Running`, fails, or times out.
 
@@ -589,9 +588,9 @@ Polls the pod phase every 5 seconds until it reaches `Running`, fails, or times 
 
 ---
 
-## Velero Functions
+### Velero Functions
 
-### `create_velero_backup(backup, ns, label)`
+#### `create_velero_backup(backup, ns, label)`
 
 Creates a Velero Backup object that backs up all resources matching the `vmpvcbackup-cr=<label>` label.
 
@@ -618,9 +617,9 @@ Creates a Velero Backup object that backs up all resources matching the `vmpvcba
 
 ---
 
-## Cleanup Functions
+### Cleanup Functions
 
-### `cleanup(pod, ns, pvcs...)`
+#### `cleanup(pod, ns, pvcs...)`
 
 Performs full cleanup after a backup completes or fails. Calls three sub-operations in sequence.
 
@@ -637,7 +636,7 @@ Performs full cleanup after a backup completes or fails. Calls three sub-operati
 
 ---
 
-### `cleanup_orphans()`
+#### `cleanup_orphans()`
 
 Sweeps all namespaces for reader pods that should have been deleted but weren't — for example due to controller restarts or edge cases.
 
@@ -652,12 +651,66 @@ Sweeps all namespaces for reader pods that should have been deleted but weren't 
 **Runs:** Every reconciliation cycle, after all CRs have been processed.
 
 ---
+### Core Logic
 
-## Core Logic
+#### `reconcile(name, ns)`
 
-### `reconcile(name, ns)`
+The main function that processes a single VMPVCBackup CR. Called once per CR per poll cycle.
 
-The main function that processes a
+|Param|Type|Description|
+|---|---|---|
+|`name`|string|Name of the VMPVCBackup CR|
+|`ns`|string|Namespace of the CR|
+
+**Flow:**
+
+```
+START
+  │
+  ├─ Phase is Completed or Failed? ──→ SKIP (return 0)
+  │
+  ├─ Read spec: vmName, backupName, osType
+  │  └─ Missing vmName or backupName? ──→ FAILED
+  │
+  ├─ Discover PVCs from VM spec
+  │
+  ├─ Velero backup already exists? ──→ CHECK RESULT
+  │  │                                   ├─ Completed → cleanup + COMPLETED
+  │  │                                   ├─ Failed    → cleanup + FAILED
+  │  │                                   └─ Other     → BACKING UP (wait)
+  │  │
+  │  ▼
+  │  BACKUP DOES NOT EXIST — full pipeline:
+  │
+  ├─ Verify VM exists ──────────────→ FAILED if not found
+  ├─ Verify PVCs found ─────────────→ FAILED if empty
+  ├─ Discover node ──────────────────→ PENDING if VM not running
+  ├─ Delete old reader pod (if any)
+  ├─ Create reader pod
+  ├─ Wait for pod Running ──────────→ FAILED on timeout
+  ├─ Label PVCs and DataVolumes
+  ├─ Save VM YAML to ConfigMap
+  ├─ Create Velero Backup ──────────→ FAILED on error
+  └─ Set phase to BackingUp
+      (next cycle will check the result)
+```
+
+---
+
+### Main Loop
+
+```bash
+while true; do
+    for each VMPVCBackup CR across all namespaces:
+        reconcile(name, namespace)
+
+    cleanup_orphans()
+
+    sleep POLL seconds
+done
+```
+
+The controller runs as an infinite polling loop. Every `POLL` seconds (default 20), it lists all VMPVCBackup CRs across all namespaces and reconciles each one. After processing all CRs, it runs a single orphan sweep pass to clean up any stale reader pods. Terminal CRs (`Completed`/`Failed`) are skipped immediately with no API calls beyond the initial phase check.
 
 ---
 
@@ -680,40 +733,6 @@ The main function that processes a
 | `status.veleroBackupName` | Name of the Velero Backup object |
 | `status.discoveredPVCs` | Space-separated list of discovered PVC names |
 | `status.message` | Human-readable status message |
-
----
-
-## Troubleshooting
-
-**CR stuck in `Pending`**
-The VM is not running. Start it with `virtctl start <vm> -n <ns>` and the controller will pick it up on the next cycle.
-
-**CR stuck in `WaitingForPod`**
-The reader pod can't schedule. Check:
-```bash
-kubectl describe pod reader-<cr-name> -n <ns>
-```
-Common causes: PVC is RWO and bound to a different node, insufficient resources, node taints.
-
-**CR stuck in `BackingUp`**
-Velero is still working. Check:
-```bash
-velero backup describe <backup-name> --details
-kubectl get podvolumebackups -n velero
-```
-
-**CR shows `Failed`**
-Read the `.status.message` field and check controller logs:
-```bash
-kubectl get vmpb <name> -n <ns> -o jsonpath='{.status.message}'
-kubectl logs -n velero -l app=vmb --tail=100
-```
-
-**Reader pod not deleted after backup**
-Ensure you're running the latest version of the controller. The orphan sweep (`cleanup_orphaned_reader_pods`) automatically removes reader pods whose CR is Completed, Failed, or deleted.
-
-**Restore: reader pod stuck in Pending on target cluster**
-Ensure the VMPVCBackup controller is deployed on the target cluster. It automatically recreates stuck pods without node constraints.
 
 ---
 
