@@ -398,116 +398,266 @@ A single-replica Deployment in the `velero` namespace that runs the `bitnami/kub
 
 The controller is a polling-based reconciliation loop written in Bash. Every 20 seconds it lists all VMPVCBackup CRs, reconciles each one, then runs restore-assist and orphan cleanup.
 
-### Global Settings
+# VMPVCBackup Controller — Function Documentation
 
-| Variable | Default | Purpose |
+## Global Variables
+
+| Variable | Default | Description |
 |---|---|---|
-| `POLL_INTERVAL` | `20` | Seconds between reconciliation cycles |
-| `POD_READY_TIMEOUT` | `300` | Max seconds to wait for reader pod to become Running |
-| `RESTORE_PENDING_THRESHOLD` | `30` | Seconds a restored reader pod must be Pending before the controller intervenes |
+| `POLL` | `20` | Seconds between each reconciliation cycle |
+| `POD_TIMEOUT` | `300` | Max seconds to wait for reader pod to reach `Running` state |
 
-### Helper Functions
+---
 
-**`patch_status(name, ns, phase, msg)`**
-Updates the CR's `.status.phase` and `.status.message` via a JSON merge patch on the status subresource. Failures are logged but don't halt the controller.
+## Utility Functions
 
-**`discover_pvcs(vm_name, ns)`**
-Reads the VirtualMachine spec and extracts PVC names from two sources:
+### `log(level, message)`
+
+Prints a timestamped log line to stdout.
+
+| Param | Type | Description |
+|---|---|---|
+| `level` | string | Log level — `INFO`, `WARN`, or `ERROR` |
+| `message` | string | Message to print |
+
+**Output format:**
+```
+[2026-03-26 11:02:10] [INFO] Controller started
+```
+
+---
+
+### `set_status(name, ns, phase, msg)`
+
+Patches the `.status.phase` and `.status.message` fields on a VMPVCBackup CR using a JSON merge patch on the status subresource.
+
+| Param | Type | Description |
+|---|---|---|
+| `name` | string | Name of the VMPVCBackup CR |
+| `ns` | string | Namespace of the CR |
+| `phase` | string | One of: `Pending`, `BackingUp`, `Completed`, `Failed` |
+| `msg` | string | Human-readable status message |
+
+**Behavior:** Logs the status transition before patching. If the patch fails (e.g. RBAC issue), logs a warning but does not halt the controller.
+
+---
+
+## Discovery Functions
+
+### `get_vm_pvcs(vm, ns)`
+
+Discovers all PVCs attached to a VirtualMachine by reading its spec.
+
+| Param | Type | Description |
+|---|---|---|
+| `vm` | string | Name of the VirtualMachine object |
+| `ns` | string | Namespace of the VM |
+
+**Returns:** Space-separated string of unique PVC names printed to stdout.
+
+**How it works:** Reads two jsonpath fields from the VM spec:
 - `.spec.template.spec.volumes[*].persistentVolumeClaim.claimName` — direct PVC references
-- `.spec.template.spec.volumes[*].dataVolume.name` — CDI DataVolume references (the DataVolume name equals the PVC name)
+- `.spec.template.spec.volumes[*].dataVolume.name` — CDI DataVolume references (DataVolume name equals PVC name)
 
-Results are deduplicated and returned as a space-separated string.
+Combines both, removes duplicates with `sort -u`, and returns the result.
 
-**`discover_node(vm_name, ns)`**
-Finds the node where the VM is running by looking up the `virt-launcher` pod with label `vm.kubevirt.io/name=<vmName>` in Running state and extracting `.spec.nodeName`.
+---
 
-**`build_backup_vols_annotation(pvcs...)`**
-Generates the `backup.velero.io/backup-volumes` annotation value. For 3 PVCs this produces `disk1,disk2,disk3` — telling Velero which volumes on the reader pod to back up with FSB.
+### `get_vm_node(vm, ns)`
 
-**`build_volume_mounts(os_type, pvcs...)`** and **`build_volumes(pvcs...)`**
-Generate the YAML fragments for `volumeMounts` and `volumes` sections of the reader pod spec. Linux PVCs are mounted at `/data1`, `/data2`, etc. Windows PVCs at `C:/data1`, `C:/data2`, etc.
+Finds the Kubernetes node where the VM is currently running.
 
-**`create_reader_pod(pod_name, ns, os_type, target_node, pvcs...)`**
-Creates the temporary reader pod with:
-- All VM PVCs mounted
-- `preferredDuringSchedulingIgnoredDuringExecution` node affinity — prefers the VM's node (required for RWO PVCs) but doesn't hard-require it (so restore on a different cluster still works)
-- `backup.velero.io/backup-volumes` annotation
-- `vmpvcbackup-cr` label
-- For Linux: `ubuntu:22.04` running `sleep infinity` with privileged security context
-- For Windows: `servercore:ltsc2022` running a PowerShell sleep loop with `kubernetes.io/os: windows` nodeSelector
+| Param | Type | Description |
+|---|---|---|
+| `vm` | string | Name of the VirtualMachine object |
+| `ns` | string | Namespace of the VM |
 
-**`wait_for_pod(pod_name, ns)`**
-Polls the pod phase every 5 seconds up to `POD_READY_TIMEOUT`. Returns 0 on Running, 1 on terminal states (Failed, Error, CrashLoopBackOff) or timeout.
+**Returns:** Node name printed to stdout, or empty string if VM is not running.
 
-**`verify_pod_node(pod_name, ns, expected_node)`**
-Checks if the reader pod actually landed on the expected node. Logs a warning if it didn't (which can happen with RWX PVCs) but continues anyway since RWO PVCs enforce co-location by nature.
+**How it works:** Looks up the `virt-launcher` pod using label `vm.kubevirt.io/name=<vm>` filtered to `status.phase=Running`, and extracts `.spec.nodeName` from the first match.
 
-**`save_vm_yaml(vm_name, ns, cr_name, pod_name)`**
-Exports the complete VirtualMachine YAML to a ConfigMap named `vm-backup-<cr_name>`. This ConfigMap is labeled with `vmpvcbackup-cr` (so Velero includes it) and `vmpvcbackup-vm-export=true` (so the restore process can find it).
+---
 
-**`cleanup_vm_yaml(cr_name, ns)`**
-Deletes the VM YAML ConfigMap after the backup finishes.
+## Resource Labeling Functions
 
-**`trigger_velero_backup(backup_name, ns, pod_name, cr_name)`**
-Creates a Velero Backup object with:
-- `includedNamespaces` — the VM's namespace
-- `includedResources` — namespaces, pods, PVCs, PVs, ConfigMaps, DataVolumes, VirtualMachines, VirtualMachineInstances
-- `orLabelSelectors` — `vmpvcbackup-cr: <pod_name>` (only backs up resources with this label)
-- `defaultVolumesToFsBackup: true` — use file-system backup for all annotated volumes
+### `label_resources(label, ns, pvcs...)`
+
+Adds the `vmpvcbackup-cr=<label>` label to PVCs and their corresponding DataVolumes. This label is what Velero's `orLabelSelectors` matches to include these resources in the backup.
+
+| Param | Type | Description |
+|---|---|---|
+| `label` | string | Label value — set to the reader pod name |
+| `ns` | string | Namespace of the resources |
+| `pvcs...` | string(s) | One or more PVC names |
+
+**Behavior:** Iterates over each PVC name and labels both the PVC and the DataVolume with the same name (if it exists). DataVolume labeling failures are silently ignored since not every PVC has a corresponding DataVolume.
+
+---
+
+### `unlabel_resources(ns, pvcs...)`
+
+Removes the `vmpvcbackup-cr` label from PVCs and DataVolumes after backup completes or fails.
+
+| Param | Type | Description |
+|---|---|---|
+| `ns` | string | Namespace of the resources |
+| `pvcs...` | string(s) | One or more PVC names |
+
+**Behavior:** Uses the `label-` syntax (`vmpvcbackup-cr-`) to remove the label. All failures are silently ignored — resources may have already been cleaned up or may not exist.
+
+---
+
+## VM YAML Preservation Functions
+
+### `save_vm_configmap(vm, ns, label)`
+
+Exports the full VirtualMachine YAML to a ConfigMap so it can be restored without including `virtualmachines` in Velero's `includedResources` (which would trigger kubevirt-velero-plugin errors on running VMs).
+
+| Param | Type | Description |
+|---|---|---|
+| `vm` | string | Name of the VirtualMachine object |
+| `ns` | string | Namespace of the VM |
+| `label` | string | Label value — used for both the ConfigMap name and the Velero selector label |
+
+**Creates:** A ConfigMap named `vm-yaml-<label>` with:
+- Key `vm.yaml` containing the full VM YAML
+- Label `vmpvcbackup-cr=<label>` — so Velero includes it in the backup
+- Label `vmpvcbackup-vm-export=true` — so the restore process can find it
+
+**How it works:** Uses `kubectl create configmap --dry-run=client` piped through `kubectl label --local` piped through `kubectl apply` to create the ConfigMap with labels in a single atomic operation.
+
+---
+
+### `delete_vm_configmap(label, ns)`
+
+Deletes the VM YAML ConfigMap after backup completes.
+
+| Param | Type | Description |
+|---|---|---|
+| `label` | string | Label value used when creating the ConfigMap |
+| `ns` | string | Namespace |
+
+**Deletes:** ConfigMap named `vm-yaml-<label>`. Uses `--ignore-not-found` so it doesn't fail if already deleted.
+
+---
+
+## Reader Pod Functions
+
+### `create_reader_pod(pod, ns, os, node, pvcs...)`
+
+Creates a temporary pod that mounts all VM PVCs so Velero can perform file-system backup through it.
+
+| Param | Type | Description |
+|---|---|---|
+| `pod` | string | Name for the reader pod |
+| `ns` | string | Namespace to create the pod in |
+| `os` | string | `linux` or `windows` — determines image, mount paths, and security context |
+| `node` | string | Target node — used as a preferred (not required) scheduling hint |
+| `pvcs...` | string(s) | One or more PVC names to mount |
+
+**Creates a pod with:**
+
+| Feature | Linux | Windows |
+|---|---|---|
+| Image | `ubuntu:22.04` | `mcr.microsoft.com/windows/servercore:ltsc2022` |
+| Command | `sleep infinity` | `PowerShell Start-Sleep` loop |
+| Mount paths | `/data1`, `/data2`, ... | `C:/data1`, `C:/data2`, ... |
+| Privileged | `true` | `false` |
+| nodeSelector | none | `kubernetes.io/os: windows` |
+
+**Key design decisions:**
+- Uses `preferredDuringSchedulingIgnoredDuringExecution` node affinity (not `required`). This ensures the pod lands on the same node as the VM during backup (needed for RWO PVCs) but can schedule on any node during a cross-cluster restore where the original node doesn't exist.
+- Carries the `backup.velero.io/backup-volumes` annotation listing `disk1,disk2,...` — this tells Velero which volumes to back up using file-system backup.
+- Carries the `vmpvcbackup-cr=<pod>` label — this is the selector Velero uses to include the pod in the backup.
+
+**Returns:** 0 on success, 1 if `kubectl apply` fails.
+
+---
+
+### `wait_pod_running(pod, ns)`
+
+Polls the pod phase every 5 seconds until it reaches `Running`, fails, or times out.
+
+| Param | Type | Description |
+|---|---|---|
+| `pod` | string | Pod name |
+| `ns` | string | Namespace |
+
+**Returns:**
+- `0` — pod is `Running`
+- `1` — pod entered `Failed`/`Error` state, or `POD_TIMEOUT` (300s) exceeded
+
+---
+
+## Velero Functions
+
+### `create_velero_backup(backup, ns, label)`
+
+Creates a Velero Backup object that backs up all resources matching the `vmpvcbackup-cr=<label>` label.
+
+| Param | Type | Description |
+|---|---|---|
+| `backup` | string | Name for the Velero Backup object |
+| `ns` | string | Namespace to include in the backup |
+| `label` | string | Label value for `orLabelSelectors` matching |
+
+**Backup includes these resource types:**
+- `namespaces` — so the namespace is recreated on restore
+- `pods` — the reader pod (triggers FSB data restore)
+- `persistentvolumeclaims` — PVC Kubernetes objects
+- `persistentvolumes` — PV Kubernetes objects
+- `configmaps` — VM YAML definition
+- `datavolumes` — CDI DataVolume metadata
+
+**Backup settings:**
+- `defaultVolumesToFsBackup: true` — uses file-system backup (restic/kopia) for all annotated volumes
 - `snapshotVolumes: false` — no CSI snapshots
+- `orLabelSelectors` — only backs up resources with the matching label, not everything in the namespace
 
-**`print_velero_errors(backup_name)`**
-On backup failure, prints detailed diagnostic information: failure reason, warning/error counts, and the last 50 lines of Velero server logs filtered to the backup name.
+**Returns:** 0 on success, 1 if `kubectl apply` fails.
 
-**`delete_reader_pod(pod_name, ns, reason)`**
-Deletes the reader pod with `--ignore-not-found --wait=false`. The reason parameter is logged for debugging.
+---
 
-### Core Reconcile Logic
+## Cleanup Functions
 
-**`reconcile(name, ns)`** processes a single VMPVCBackup CR through these stages:
+### `cleanup(pod, ns, pvcs...)`
 
-1. **Skip terminal CRs** — if phase is Completed or Failed, return immediately.
-2. **Read spec** — extract vmName, backupName, osType from the CR.
-3. **Verify VM exists** — fail if the VirtualMachine object isn't found.
-4. **Discover PVCs** — fail if no PVCs are found on the VM.
-5. **Discover node** — find which node the VM is running on. If the VM isn't running, stay in Pending and retry next cycle.
-6. **Create or reuse reader pod** — if a reader pod already exists on the correct node and is Running, reuse it. If it's on the wrong node or in a failed state, delete and recreate.
-7. **Wait for pod** — poll until the reader pod is Running or timeout.
-8. **Verify pod node** — confirm the reader pod landed on the expected node (logs a warning if not).
-9. **Save VM YAML** — export VM definition to ConfigMap.
-10. **Trigger Velero backup** — create the Backup object (skipped if backup already exists).
-11. **Handle result** — check the Velero backup phase: on Completed or Failed, delete reader pod, clean up ConfigMap, and patch CR status. Otherwise, leave for next polling cycle.
+Performs full cleanup after a backup completes or fails. Calls three sub-operations in sequence.
 
-### Restore Assist — fix_stuck_restore_pods
+| Param | Type | Description |
+|---|---|---|
+| `pod` | string | Reader pod name |
+| `ns` | string | Namespace |
+| `pvcs...` | string(s) | PVC names to unlabel |
 
-**`fix_stuck_restore_pods()`** runs every reconciliation cycle and handles cross-cluster restore scenarios:
+**Actions:**
+1. Deletes the reader pod (`--grace-period=30`, `--wait=false`)
+2. Deletes the VM YAML ConfigMap via `delete_vm_configmap`
+3. Removes backup labels from PVCs and DataVolumes via `unlabel_resources`
 
-1. Lists all `Pending` pods with label `app=vmpvcbackup-reader` across all namespaces.
-2. Skips pods younger than `RESTORE_PENDING_THRESHOLD` seconds (gives them time to schedule normally).
-3. Only acts on pods that have the `velero.io/restore-name` label (confirmed restore artifacts).
-4. Only acts on pods with `FailedScheduling` events (the node doesn't exist).
-5. For matching pods: extracts the PVC list and container image from the stuck pod, deletes it, and recreates it without any node affinity so the scheduler can place it on any available node.
+---
 
-This allows PodVolumeRestores to proceed on the new cluster without manual intervention.
+### `cleanup_orphans()`
 
-### Orphan Sweep — cleanup_orphaned_reader_pods
+Sweeps all namespaces for reader pods that should have been deleted but weren't — for example due to controller restarts or edge cases.
 
-**`cleanup_orphaned_reader_pods()`** catches reader pods that weren't cleaned up due to controller restarts or edge cases:
+**Takes no parameters.**
 
-1. Lists all pods with label `app=vmpvcbackup-reader`.
-2. For each pod, derives the CR name (by stripping the `reader-` prefix).
-3. Checks the CR's phase. If Completed, Failed, or the CR no longer exists (NotFound), deletes the orphaned reader pod.
+**How it works:**
+1. Lists all pods with label `app=vmpvcbackup-reader` across all namespaces
+2. For each pod, derives the CR name by stripping the `reader-` prefix from the pod name
+3. Looks up the CR's phase in the pod's namespace
+4. If the CR is `Completed`, `Failed`, or `NotFound` (deleted) → deletes the orphaned reader pod
 
-### Main Loop
+**Runs:** Every reconciliation cycle, after all CRs have been processed.
 
-```
-while true:
-  1. List all VMPVCBackup CRs across all namespaces
-  2. Reconcile each one
-  3. Run fix_stuck_restore_pods()
-  4. Run cleanup_orphaned_reader_pods()
-  5. Sleep POLL_INTERVAL seconds
-```
+---
+
+## Core Logic
+
+### `reconcile(name, ns)`
+
+The main function that processes a
 
 ---
 
