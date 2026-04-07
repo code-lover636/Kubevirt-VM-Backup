@@ -103,7 +103,7 @@ spec:
                 sudo: ALL=(ALL) NOPASSWD:ALL
                 shell: /bin/bash
                 ssh_authorized_keys:
-                  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFnt6ZBwBUW0F/hPffkHDgPIy+4JnR6ZFfrQLqpBXx0G jiya@DESKTOP-FEUJGCU"
+                  - ""
             chpasswd:
               list: |
                 jiya:jiya123
