@@ -54,6 +54,8 @@ spec:
                 type: string
               message:
                 type: string
+              progress:
+                type: string
     subresources:
       status: {}
     additionalPrinterColumns:
@@ -72,6 +74,9 @@ spec:
     - name: Backup
       type: string
       jsonPath: .status.veleroBackupName
+    - name: Progress
+      type: string
+      jsonPath: .status.progress
     - name: Age
       type: date
       jsonPath: .metadata.creationTimestamp
@@ -111,7 +116,7 @@ rules:
   resources: [datavolumes]
   verbs: [get, list, patch, update]
 - apiGroups: [velero.io]
-  resources: [backups]
+  resources: [backups, podvolumebackups]
   verbs: [get, list, watch, create]
 
 ---
@@ -146,6 +151,52 @@ data:
     POD_TIMEOUT=300
 
     log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2"; }
+
+    # ── Format bytes to human-readable ────────────────────────
+    format_bytes() {
+      local b=$1
+      if [[ $b -ge 1073741824 ]]; then
+        awk "BEGIN{printf \"%.1fGiB\", $b/1073741824}"
+      elif [[ $b -ge 1048576 ]]; then
+        awk "BEGIN{printf \"%.1fMiB\", $b/1048576}"
+      elif [[ $b -ge 1024 ]]; then
+        awk "BEGIN{printf \"%.0fKiB\", $b/1024}"
+      else
+        echo "${b}B"
+      fi
+    }
+
+    # ── Get backup progress from PodVolumeBackups ─────────────
+    get_backup_progress() {
+      local backup=$1
+      local pvb_list bytes_total=0 bytes_done=0 vols=0 active=0
+
+      pvb_list=$(kubectl get podvolumebackups -n velero \
+        -l "velero.io/backup-name=${backup}" \
+        -o custom-columns=DONE:.status.progress.bytesDone,TOTAL:.status.progress.totalBytes,PHASE:.status.phase \
+        --no-headers 2>/dev/null) || { echo "Initializing..."; return; }
+
+      [[ -z "$pvb_list" ]] && { echo "Initializing..."; return; }
+
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local d t p
+        d=$(awk '{print $1}' <<< "$line")
+        t=$(awk '{print $2}' <<< "$line")
+        p=$(awk '{print $3}' <<< "$line")
+        [[ "$d" == "<none>" ]] && d=0
+        [[ "$t" == "<none>" ]] && t=0
+        bytes_done=$((bytes_done + d))
+        bytes_total=$((bytes_total + t))
+        vols=$((vols + 1))
+        [[ "$p" == "InProgress" ]] && active=$((active + 1))
+      done <<< "$pvb_list"
+
+      local pct=0
+      [[ $bytes_total -gt 0 ]] && pct=$((bytes_done * 100 / bytes_total))
+
+      echo "$(format_bytes $bytes_done)/$(format_bytes $bytes_total) ${pct}% [${active}/${vols} vols active]"
+    }
 
     # ── Update CR status ────────────────────────────────────────
     set_status() {
@@ -343,6 +394,53 @@ data:
       log "INFO" "[$pod] Cleanup done"
     }
 
+    # ── Monitor backup progress until completion ──────────────
+    monitor_backup() {
+      local name=$1 ns=$2 backup=$3 pod=$4; shift 4
+      local pvcs=("$@")
+
+      log "INFO" "[$name] Monitoring backup '$backup' (polling every 5s)"
+
+      while true; do
+        local bp
+        bp=$(kubectl get backup "$backup" -n velero \
+          -o jsonpath='{.status.phase}' 2>/dev/null || echo "New")
+
+        case "$bp" in
+          Completed)
+            local progress
+            progress=$(get_backup_progress "$backup")
+            cleanup "$pod" "$ns" "${pvcs[@]}"
+            kubectl patch vmpvcbackup "$name" -n "$ns" \
+              --subresource=status --type=merge \
+              -p "{\"status\":{\"phase\":\"Completed\",\"message\":\"Backup completed\",\"progress\":\"${progress} - done\"}}" \
+              2>/dev/null || true
+            log "INFO" "[$name] Backup completed — $progress"
+            return 0
+            ;;
+          Failed|PartiallyFailed)
+            cleanup "$pod" "$ns" "${pvcs[@]}"
+            local err
+            err=$(kubectl get backup "$backup" -n velero \
+              -o jsonpath='{.status.failureReason}' 2>/dev/null || echo "see velero logs")
+            set_status "$name" "$ns" "Failed" "Backup failed: $err"
+            return 1
+            ;;
+          *)
+            local progress
+            progress=$(get_backup_progress "$backup")
+            kubectl patch vmpvcbackup "$name" -n "$ns" \
+              --subresource=status --type=merge \
+              -p "{\"status\":{\"phase\":\"BackingUp\",\"message\":\"Uploading volumes\",\"progress\":\"${progress}\"}}" \
+              2>/dev/null || true
+            log "INFO" "[$name] Progress: $progress"
+            ;;
+        esac
+
+        sleep 5
+      done
+    }
+
     # ════════════════════════════════════════════════════════════
     # RECONCILE — one CR at a time
     # ════════════════════════════════════════════════════════════
@@ -391,7 +489,8 @@ data:
             set_status "$name" "$ns" "Failed" "Backup '$backup_name' failed: $err"
             ;;
           *)
-            set_status "$name" "$ns" "BackingUp" "Backup '$backup_name' in progress ($bp)"
+            # Backup still in progress — monitor with live progress
+            monitor_backup "$name" "$ns" "$backup_name" "$pod" "${pvcs[@]}"
             ;;
         esac
         return 0
@@ -468,7 +567,10 @@ data:
         return 1
       fi
       set_status "$name" "$ns" "BackingUp" "Velero backup '$backup_name' triggered"
-      log "INFO" "[$name] Backup '$backup_name' created — will track on next cycle"
+      log "INFO" "[$name] Backup '$backup_name' created — monitoring progress"
+
+      # ── Step 6: Monitor backup until completion ─────────────
+      monitor_backup "$name" "$ns" "$backup_name" "$pod" "${pvcs[@]}"
     }
 
     # ── Orphan sweep — delete reader pods with no active CR ─────
